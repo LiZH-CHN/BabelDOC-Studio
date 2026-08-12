@@ -203,7 +203,7 @@ python -m BabelDOC_Studio
 
 ---
 
-## 🗂️ 项目结构
+##  项目结构
 
 ```
 BabelDOC/
@@ -248,7 +248,7 @@ python main.py
 
 ---
 
-## 📄 许可证
+##  许可证
 
 本项目基于 [AGPL-3.0](LICENSE) 许可证开源。
 
@@ -256,7 +256,7 @@ BabelDOC 核心库亦采用 AGPL-3.0 许可证，任何修改和分发都需遵�
 
 ---
 
-## 🙏 致谢
+##  致谢
 
 - [BabelDOC](https://github.com/funstory-ai/BabelDOC) — 核心 PDF 翻译引擎
 - [uv](https://github.com/astral-sh/uv) — 极速 Python 包管理工具
@@ -264,7 +264,7 @@ BabelDOC 核心库亦采用 AGPL-3.0 许可证，任何修改和分发都需遵�
 
 ---
 
-## 📞 联系方式
+##  联系方式
 
 - 邮箱：lizihao0104@126.com；欢迎反馈问题
 
