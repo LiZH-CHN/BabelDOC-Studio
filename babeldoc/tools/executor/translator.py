@@ -71,9 +71,12 @@ class ExecutorTranslator(BaseTranslator):
         body: dict[str, Any] = {
             "model": self.model,
             "temperature": 0,
-            "max_tokens": 2048,
             "messages": [{"role": "user", "content": text}],
         }
+        body["max_tokens"] = int(rate_limit_params.get("max_tokens", 0)) if rate_limit_params else 0
+        if not body["max_tokens"]:
+            input_tokens = int(len(text) * 0.4 + 0.5)
+            body["max_tokens"] = max(8192, input_tokens * 6 + 1024)
         if rate_limit_params and rate_limit_params.get("request_json_mode"):
             body["response_format"] = {"type": "json_object"}
 

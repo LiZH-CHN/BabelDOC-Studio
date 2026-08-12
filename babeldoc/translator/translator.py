@@ -134,6 +134,9 @@ class BaseTranslator(ABC):
                 logger.debug(f"try get cache failed, ignore it: {e}")
         _translate_rate_limiter.wait()
         translation = self.do_translate(text, rate_limit_params)
+        if translation is None:
+            logger.warning("do_translate returned None, using original text as fallback")
+            translation = text
         if not (self.ignore_cache or ignore_cache):
             self.cache.set(text, translation)
         return translation
@@ -155,6 +158,9 @@ class BaseTranslator(ABC):
                 logger.debug(f"try get cache failed, ignore it: {e}")
         _translate_rate_limiter.wait()
         translation = self.do_llm_translate(text, rate_limit_params)
+        if translation is None:
+            logger.warning("do_llm_translate returned None, using original text as fallback")
+            translation = text
         if not (self.ignore_cache or ignore_cache):
             try:
                 self.cache.set(text, translation)
@@ -234,7 +240,12 @@ class OpenAITranslator(BaseTranslator):
                 limits=httpx.Limits(
                     max_connections=None, max_keepalive_connections=None
                 ),
-                timeout=600,
+                timeout=httpx.Timeout(
+                    connect=60.0,
+                    read=1800.0,
+                    write=60.0,
+                    pool=60.0,
+                ),
             ),
         )
         if send_temperature:
@@ -276,11 +287,157 @@ class OpenAITranslator(BaseTranslator):
         response = self.client.chat.completions.create(
             model=self.model,
             **options,
+
             messages=self.prompt(text),
             extra_body=self.extra_body,
         )
         self.update_token_count(response)
-        return response.choices[0].message.content.strip()
+        content = response.choices[0].message.content
+        if content is None:
+            reasoning = getattr(response.choices[0].message, "reasoning_content", None)
+            if reasoning:
+                logger.warning("message.content is None, falling back to reasoning_content")
+                content = reasoning
+            else:
+                logger.warning(f"API returned None content for text (len={len(text)}), returning original text")
+                return text
+        stripped = content.strip()
+        if not stripped:
+            logger.warning(f"API returned empty content for text (len={len(text)}), returning original text")
+            return text
+        stripped = self._extract_translation_from_output(stripped, text)
+        return stripped
+
+    @staticmethod
+    def _extract_translation_from_output(output: str, original_text: str) -> str:
+        """从推理链/分析文本中提取纯译文，仅当检测到推理链特征时才介入"""
+        if len(output) < 50:
+            return output
+
+        import re
+
+        # 检测推理链特征：编号步骤 + 分析关键词
+        cot_patterns = [
+            r'(?:^|\n)\s*\d+\.\s*\*\*',
+            r'(?:^|\n)\s*\d+\.\s*Analyze',
+            r'(?:^|\n)\s*\d+\.\s*[Rr]ole\b',
+            r'(?:^|\n)\s*\d+\.\s*[Ii]nput\b',
+            r'(?:^|\n)\s*\d+\.\s*[Gg]oal\b',
+            r'(?:^|\n)\s*\d+\.\s*[Tt]ask\b',
+            r'(?:^|\n)\s*\d+\.\s*[Rr]eview\b',
+            r'(?:^|\n)\s*\d+\.\s*[Tt]ranslate\b',
+            r'(?:^|\n)\s*(?:分析|角色|任务|目标|输入|审查|最终输出)',
+        ]
+        is_cot = any(re.search(p, output) for p in cot_patterns)
+        if not is_cot:
+            return output
+
+        # 预处理：移除推理旁白（括号内内容、行内注释）
+        # 步骤1：移除所有括号及括号内的内容（推理旁白）
+        cleaned = re.sub(r'\s*\([^)]*\)', '', output)
+        # 步骤2：移除行内推理注释（- wait, ... / — Let's ... 等）
+        cleaned = re.sub(r'\s*[-—–]\s*(?:wait|let[\'\u2019]s|actually|hmm|but\s+wait).*', '', cleaned, flags=re.IGNORECASE)
+        # 步骤3：仅移除推理关键词及其后最多3个词，不删除到行尾
+        cleaned = re.sub(
+            r'\b(?:wait|let[\'\u2019]s|actually|hmm|but\s+wait|or\s+just|stick\s+closer)[\s,.]*(?:\S+\s*){0,3}',
+            '', cleaned, flags=re.IGNORECASE,
+        )
+
+        # 方法1：匹配 "Translation:" 行后的内容
+        matches = re.findall(
+            r'(?:^|\n)\s*\*?\s*Translation\s*:?\s*(.+)',
+            cleaned, re.MULTILINE | re.IGNORECASE,
+        )
+        if matches:
+            return matches[-1].strip()
+
+        # 方法2：提取 "Translate" 章节（到下一个编号步骤为止）
+        translate_section = re.search(
+            r'(?:^|\n)\d+\.\s*\*{1,2}[Tt]ranslate.+?\*{1,2}[ \t]*\n?(.*?)(?:\n\s*\d+\.\s*\*|$)',
+            cleaned, re.DOTALL,
+        )
+        if translate_section:
+            section_text = translate_section.group(1).strip()
+            # 从该章节中提取纯中文行（过滤英文推理行）
+            cn_lines = re.findall(
+                r'(?:^|\n)[ \t]*[\u4e00-\u9fff][^\n]{5,}',
+                section_text, re.MULTILINE,
+            )
+            if cn_lines:
+                combined = '\n'.join(l.strip() for l in cn_lines)
+                if len(combined) > 10:
+                    return combined
+
+        # 方法3：从清理后的文本中提取箭头格式译文（含推理词的已去除）
+        arrow_matches = []
+        for m in re.finditer(r'(?:->|→)\s*(.+?)(?:\s*\n|\s*$)', cleaned):
+            target = m.group(1)
+            if not re.search(r'[\u4e00-\u9fff]', target):
+                continue
+            # 检查目标本身是否包含推理旁白
+            if re.search(r'\b(?:wait|let[\'\u2019]s|actually|hmm|but\s+wait|or\s+just|stick\s+closer)\b', target, re.IGNORECASE):
+                continue
+            # 过滤明显太短的片段（可能是占位翻译）
+            if len(target.strip()) < 3:
+                continue
+            arrow_matches.append(target.strip())
+        if arrow_matches:
+            combined = ''.join(arrow_matches)
+            if len(combined) > 10:
+                return combined
+
+        # 方法4：从清理后的文本中提取含"翻译"/"译文"标记的段落
+        cn_fallback = re.findall(
+            r'(?:^|\n).*?(?:翻译|译文)[：:]\s*([\u4e00-\u9fff][^\n]{4,})',
+            cleaned, re.MULTILINE,
+        )
+        if cn_fallback:
+            candidate = cn_fallback[-1].strip()
+            if len(candidate) > 5:
+                return candidate
+
+        # 方法5：提取最后一个包含"翻译结果"/"最终输出"标记的段落
+        result_hint = re.search(
+            r'(?:^|\n).*?(?:翻译结果|译文[：:]|最终输出|翻译[：:]\s*)([\u4e00-\u9fff][^\n]{4,})',
+            cleaned, re.MULTILINE,
+        )
+        if result_hint:
+            candidate = result_hint.group(1).strip()
+            if len(candidate) > 5:
+                return candidate
+
+        # 方法6：从清理后的整个文本中提取最长的中文文本段（不限行首位置）
+        cn_blocks = re.findall(
+            r'([\u4e00-\u9fff\u3000-\u303f\uff00-\uffef][^\n]{9,})',
+            cleaned,
+        )
+        if cn_blocks:
+            # 过滤掉含推理关键词的块
+            filtered = [b for b in cn_blocks if not re.search(
+                r'\b(?:wait|let[\'\u2019]s|actually|hmm|but\s+wait|or\s+just|stick\s+closer|analysis|analyze|role|review)\b',
+                b, re.IGNORECASE,
+            )]
+            if filtered:
+                # 返回最长的一个
+                best = max(filtered, key=len)
+                return best.strip()
+            # 如果全被过滤，返回最长的一个（总比推理碎片好）
+            return max(cn_blocks, key=len).strip()
+
+        # 方法7：提取所有较短中文连续段（≥3字符），合并后返回
+        all_cn = re.findall(
+            r'([\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]{2,}[^\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]?[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]*)',
+            cleaned,
+        )
+        if all_cn:
+            combined = ''.join(all_cn)
+            if len(combined) >= 5:
+                return combined.strip()
+
+        # 无法安全提取 → 如果清理后的文本包含中文，返回清理后文本；否则回退到原文本
+        if re.search(r'[\u4e00-\u9fff]', cleaned) and len(cleaned.strip()) > 5:
+            return cleaned.strip()
+        return original_text
 
     def prompt(self, text):
         return [
@@ -290,7 +447,7 @@ class OpenAITranslator(BaseTranslator):
             },
             {
                 "role": "user",
-                "content": f";; Treat next line as plain text input and translate it into {self.lang_out}, output translation ONLY. If translation is unnecessary (e.g. proper nouns, codes, {'{{1}}, etc. '}), return the original text. NO explanations. NO notes. Input:\n\n{text}",
+                "content": f";; Treat next line as plain text input and translate it into {self.lang_out}, output translation ONLY. You MUST translate all natural language sentences into {self.lang_out}. Only keep the original text unchanged for: pure numbers, URLs, email addresses, code identifiers, LaTeX/math formulas (e.g. {{1}}), and single proper nouns without meaning. Do NOT return English sentences untranslated. NO explanations. NO notes. Input:\n\n{text}",
             },
         ]
 
@@ -311,6 +468,19 @@ class OpenAITranslator(BaseTranslator):
             "request_json_mode", False
         ):
             options["response_format"] = {"type": "json_object"}
+        max_tokens = 0
+        if rate_limit_params:
+            max_tokens = int(rate_limit_params.get("max_tokens", 0)) or 0
+        if not max_tokens:
+            input_tokens = int(len(text) * 0.4 + 0.5)
+            max_tokens = max(8192, input_tokens * 6 + 1024)
+
+        is_json_mode = (
+            rate_limit_params.get("request_json_mode", False)
+            if rate_limit_params else False
+        )
+        min_tokens = 4096 if is_json_mode else 8192
+        max_tokens = max(max_tokens, min_tokens)
 
         extra_headers = {}
         if self.send_dashscope_header:
@@ -321,7 +491,7 @@ class OpenAITranslator(BaseTranslator):
             response = self.client.chat.completions.create(
                 model=self.model,
                 **options,
-                max_tokens=2048,
+                max_tokens=max_tokens,
                 messages=[
                     {
                         "role": "user",
@@ -332,7 +502,35 @@ class OpenAITranslator(BaseTranslator):
                 extra_body=self.extra_body,
             )
             self.update_token_count(response)
-            return response.choices[0].message.content.strip()
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
+            if finish_reason == "length":
+                logger.warning(
+                    f"llm_translate output was truncated by token limit "
+                    f"(max_tokens={max_tokens}), reset max_tokens may help."
+                )
+            content = response.choices[0].message.content
+            if content is None:
+                reasoning = getattr(response.choices[0].message, "reasoning_content", None)
+                if reasoning and finish_reason == "length":
+                    retry_tokens = max_tokens * 2
+                    logger.warning(
+                        f"llm_translate: content is None due to token limit "
+                        f"(max_tokens={max_tokens}), retrying with max_tokens={retry_tokens}"
+                    )
+                    retry_params = dict(rate_limit_params or {})
+                    retry_params["max_tokens"] = retry_tokens
+                    return self.do_llm_translate(text, retry_params)
+                elif reasoning:
+                    logger.warning("llm_translate: content is None, falling back to reasoning_content")
+                    content = reasoning
+                else:
+                    logger.warning(f"llm_translate: API returned None content, returning original text (len={len(text) if text else 0})")
+                    return text
+            stripped = content.strip()
+            if not stripped:
+                logger.warning(f"llm_translate: API returned empty content, returning original text (len={len(text) if text else 0})")
+                return text
+            return stripped
         except openai.BadRequestError as e:
             if (
                 "系统检测到输入或生成内容可能包含不安全或敏感内容，请您避免输入易产生敏感内容的提示语，感谢您的配合。"

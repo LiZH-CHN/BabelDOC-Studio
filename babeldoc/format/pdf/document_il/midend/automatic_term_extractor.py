@@ -47,13 +47,13 @@ You are an expert multilingual terminologist. Extract key terms from the text an
 {reference_glossary_section}
 
 ### Output Format
-- Return ONLY a valid JSON array.
+- Return ONLY a valid JSON array. No analysis, no reasoning, no explanations.
 - Each element: {{"src": "...", "tgt": "..."}}.
-- No comments, no backticks, no extra text.
 - If no terms: [].
+- Start your response with '['.
 
 ### Example
-For terms “LLM”, “GPT”:
+For terms "LLM", "GPT":
 {example_output}
 
 Input Text:
@@ -61,8 +61,7 @@ Input Text:
 {text_to_process}
 ```
 
-Return JSON ONLY. NO OTHER TEXT.
-Result:
+[
 """
 
 
@@ -176,7 +175,8 @@ class AutomaticTermExtractor:
         )
         return total_tokens, prompt_tokens, completion_tokens, cache_hit_prompt_tokens
 
-    def _clean_json_output(self, llm_output: str) -> str:
+    @staticmethod
+    def _clean_json_output(llm_output: str) -> str:
         llm_output = llm_output.strip()
         if llm_output.startswith("<json>"):
             llm_output = llm_output[6:]
@@ -188,18 +188,88 @@ class AutomaticTermExtractor:
             llm_output = llm_output[3:]
         if llm_output.endswith("```"):
             llm_output = llm_output[:-3]
+        llm_output = llm_output.strip()
+        first_brace = llm_output.find('{')
+        first_bracket = llm_output.find('[')
+        start = -1
+        if first_brace == -1 and first_bracket == -1:
+            return llm_output
+        if first_brace == -1:
+            start = first_bracket
+        elif first_bracket == -1:
+            start = first_brace
+        else:
+            start = min(first_brace, first_bracket)
+        if start > 0:
+            llm_output = llm_output[start:]
         return llm_output.strip()
+
+    @staticmethod
+    def _robust_json_decode(text: str):
+        decoder = json.JSONDecoder()
+        objs = []
+        idx = 0
+        text = text.strip()
+        while idx < len(text):
+            while idx < len(text) and text[idx] in ' \t\n\r':
+                idx += 1
+            if idx >= len(text):
+                break
+            try:
+                obj, idx = decoder.raw_decode(text, idx)
+                objs.append(obj)
+            except json.JSONDecodeError:
+                idx += 1
+                continue
+        if not objs:
+            return None
+        if len(objs) == 1:
+            return objs[0] if isinstance(objs[0], list) else [objs[0]]
+        result = []
+        for obj in objs:
+            if isinstance(obj, list):
+                result.extend(obj)
+            else:
+                result.append(obj)
+        return result
+
+    @staticmethod
+    def _extract_terms_from_natural_language(text: str):
+        """从自然语言推理链中提取 src->tgt 术语对"""
+        import re
+        terms = []
+        patterns = [
+            r'"([^"]+)"\s*[-→>]+\s*"([^"]+)"',
+            r'([\w\s\-/]+)\s*[-→>]+\s*([\w\s\-/]+)',
+            r'"src":\s*"([^"]+)"[^}]*"tgt":\s*"([^"]+)"',
+        ]
+        for pattern in patterns:
+            matches = re.findall(pattern, text)
+            for src, tgt in matches:
+                src = src.strip()
+                tgt = tgt.strip()
+                if (
+                    src and tgt
+                    and len(src) < 100
+                    and len(tgt) < 100
+                    and not any(c in src for c in '{}[]')
+                    and not any(c in tgt for c in '{}[]')
+                    and src != tgt
+                ):
+                    terms.append({"src": src, "tgt": tgt})
+            if terms:
+                break
+        return terms if terms else None
 
     def _process_llm_response(self, llm_response_text: str, request_id: str):
         try:
             cleaned_response_text = self._clean_json_output(llm_response_text)
-            extracted_data = json.loads(cleaned_response_text)
-
-            if not isinstance(extracted_data, list):
-                logger.warning(
-                    f"Request ID {request_id}: LLM response was not a JSON list, but type: {type(extracted_data)}. Content: {cleaned_response_text[:200]}"
-                )
+            extracted_data = self._robust_json_decode(cleaned_response_text)
+            if extracted_data is None:
                 return
+
+            if isinstance(extracted_data, dict):
+                extracted_data = [extracted_data]
 
             for item in extracted_data:
                 if isinstance(item, dict) and "src" in item and "tgt" in item:
@@ -329,13 +399,30 @@ class AutomaticTermExtractor:
                 rate_limit_params={
                     "paragraph_token_count": paragraph_token_count,
                     "request_json_mode": True,
+                    "max_tokens": 4096,
                 },
             )
             tracker.set_output(output)
+            if not output or not output.strip():
+                logger.warning("Empty output from LLM during automatic terms extract, skipping")
+                return
             cleaned_output = self._clean_json_output(output)
-            response = json.loads(cleaned_output)
+            if not cleaned_output:
+                logger.warning("Empty cleaned output during automatic terms extract, skipping")
+                return
+
+            response = self._robust_json_decode(cleaned_output)
+            if response is None:
+                prepended = "[" + output
+                response = self._robust_json_decode(self._clean_json_output(prepended))
+
+            if response is None:
+                response = self._extract_terms_from_natural_language(output)
+                if not response:
+                    return
+
             if not isinstance(response, list):
-                response = [response]  # Ensure we have a list
+                response = [response]
 
             for term in response:
                 if isinstance(term, dict) and "src" in term and "tgt" in term:

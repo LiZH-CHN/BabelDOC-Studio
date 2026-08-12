@@ -1446,7 +1446,8 @@ class PDFCreater:
         check_font_exists: bool = False,
     ) -> TranslateResult:
         try:
-            basename = Path(translation_config.input_file).stem
+            orig_stem = Path(translation_config.input_file).stem
+            basename = f"中文翻译_{orig_stem[:15]}"
             debug_suffix = ".debug" if translation_config.debug else ""
             if (
                 translation_config.watermark_output_mode

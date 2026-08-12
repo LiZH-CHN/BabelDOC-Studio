@@ -23,7 +23,8 @@ class ResultMerger:
         if not results:
             raise ValueError("No results to merge")
 
-        basename = Path(self.config.input_file).stem
+        orig_stem = Path(self.config.input_file).stem
+        basename = f"中文翻译_{orig_stem[:15]}"
         debug_suffix = ".debug" if self.config.debug else ""
 
         mono_file_name = f"{basename}{debug_suffix}.{self.config.lang_out}.mono.pdf"

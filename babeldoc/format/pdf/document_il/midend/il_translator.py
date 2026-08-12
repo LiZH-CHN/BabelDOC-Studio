@@ -41,7 +41,7 @@ from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
 from babeldoc.format.pdf.document_il.utils.style_helper import GRAY80
 from babeldoc.format.pdf.translation_config import TitleContextSnapshot
 from babeldoc.format.pdf.translation_config import TranslationConfig
-from babeldoc.translator.translator import BaseTranslator
+from babeldoc.translator.translator import BaseTranslator, OpenAITranslator
 from babeldoc.utils.priority_thread_pool_executor import PriorityThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
@@ -449,7 +449,9 @@ class ILTranslator:
         tracker: PageTranslateTracker = None,
     ):
         self.translation_config.raise_if_cancelled()
-        for paragraph in page.pdf_paragraph:
+        page_num = page.page_number + 1 if page.page_number is not None else 0
+        para_total = len(page.pdf_paragraph)
+        for para_idx, paragraph in enumerate(page.pdf_paragraph):
             page_font_map = {}
             for font in page.pdf_font:
                 page_font_map[font.font_id] = font
@@ -466,6 +468,7 @@ class ILTranslator:
                         paragraph
                     )
                 )
+            logger.info(f"Translate Paragraphs: 翻译到第 {page_num} 页第 {para_idx + 1}/{para_total} 段")
             executor.submit(
                 self.translate_paragraph,
                 paragraph,
@@ -722,7 +725,7 @@ class ILTranslator:
 
             # 如果占位符数量超过阈值，且未禁用富文本翻译，则递归调用并禁用富文本翻译
             if len(placeholders) > 40 and not disable_rich_text_translate:
-                logger.warning(
+                logger.debug(
                     f"Too many placeholders ({len(placeholders)}) in paragraph[{paragraph.debug_id}], "
                     "disabling rich text translation for this paragraph",
                 )
@@ -1253,6 +1256,8 @@ class ILTranslator:
                         },
                     )
                     llm_translate_tracker.set_output(translated_text)
+                    if translated_text:
+                        translated_text = OpenAITranslator._extract_translation_from_output(translated_text, text)
                 else:
                     translated_text = self.translate_engine.translate(
                         text,
@@ -1260,6 +1265,9 @@ class ILTranslator:
                             "paragraph_token_count": paragraph_token_count
                         },
                     )
+                if translated_text is None:
+                    logger.warning(f"Translation returned None for paragraph {paragraph.debug_id}, using original text")
+                    translated_text = text
                 translated_text = re.sub(r"[. 。…，]{20,}", ".", translated_text)
 
                 # Post-translation processing

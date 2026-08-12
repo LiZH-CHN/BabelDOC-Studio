@@ -31,7 +31,7 @@ from babeldoc.format.pdf.document_il.utils.paragraph_helper import (
 )
 from babeldoc.format.pdf.translation_config import TitleContextSnapshot
 from babeldoc.format.pdf.translation_config import TranslationConfig
-from babeldoc.translator.translator import BaseTranslator
+from babeldoc.translator.translator import BaseTranslator, OpenAITranslator
 from babeldoc.utils.priority_thread_pool_executor import PriorityThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
@@ -715,11 +715,22 @@ class ILTranslatorLLMOnly:
             )
             for llm_translate_tracker in llm_translate_trackers:
                 llm_translate_tracker.set_output(llm_output)
-            llm_output = llm_output.strip()
+            llm_output = llm_output.strip() if llm_output else ""
+
+            if not llm_output:
+                raise Exception("LLM returned empty output during translation")
 
             llm_output = self._clean_json_output(llm_output)
 
-            parsed_output = json.loads(llm_output)
+            if not llm_output:
+                raise Exception("LLM output cleaned to empty string during translation")
+
+            try:
+                parsed_output = self._robust_json_decode(llm_output)
+                if parsed_output is None:
+                    raise json.JSONDecodeError("No valid JSON found", llm_output, 0)
+            except json.JSONDecodeError as e:
+                raise Exception(f"JSON parse failed: {e}. Output preview: {llm_output[:200]}")
 
             if isinstance(parsed_output, dict) and parsed_output.get(
                 "output", parsed_output.get("input", False)
@@ -758,6 +769,7 @@ class ILTranslatorLLMOnly:
                     llm_translate_tracker = inputs[id_][4]
 
                     input_unicode = inputs[id_][0]
+                    translated_text = OpenAITranslator._extract_translation_from_output(translated_text, input_unicode)
                     output_unicode = translated_text
 
                     trimed_input = re.sub(r"[. 。…，]{20,}", ".", input_unicode)
@@ -781,14 +793,40 @@ class ILTranslatorLLMOnly:
                         continue
 
                     if not (0.3 < output_token_count / input_token_count < 3):
-                        llm_translate_tracker.set_error_message(
-                            f"Translation result is too long or too short. Input: {input_token_count}, Output: {output_token_count}"
-                        )
-                        logger.warning(
-                            f"Translation result is too long or too short. Input: {input_token_count}, Output: {output_token_count}"
-                        )
-                        llm_translate_tracker.set_placeholder_full_match()
-                        continue
+                        # 对极短文本放宽比例限制：token 数过少时比例无意义
+                        if input_token_count <= 3:
+                            if not (0.01 < output_token_count / input_token_count < 50):
+                                llm_translate_tracker.set_error_message(
+                                    f"Translation result is too long or too short (short text). Input: {input_token_count}, Output: {output_token_count}"
+                                )
+                                logger.warning(
+                                    f"Translation result is too long or too short (short text). Input: {input_token_count}, Output: {output_token_count}"
+                                )
+                                llm_translate_tracker.set_placeholder_full_match()
+                                continue
+                        elif input_token_count <= 10:
+                            if not (+0.1 < output_token_count / input_token_count < 10):
+                                llm_translate_tracker.set_error_message(
+                                    f"Translation result is too long or too short (medium text). Input: {input_token_count}, Output: {output_token_count}"
+                                )
+                                logger.warning(
+                                    f"Translation result is too long or too short (medium text). Input: {input_token_count}, Output: {output_token_count}"
+                                )
+                                llm_translate_tracker.set_placeholder_full_match()
+                                continue
+                        else:
+                            # 含中文时放宽上限至 5x（CoT 残留推理文本可能导致 token 偏多）
+                            has_chinese = bool(re.search(r'[\u4e00-\u9fff]', output_unicode))
+                            upper_bound = 5 if has_chinese else 3
+                            if not (0.3 < output_token_count / input_token_count < upper_bound):
+                                llm_translate_tracker.set_error_message(
+                                    f"Translation result is too long or too short. Input: {input_token_count}, Output: {output_token_count}"
+                                )
+                                logger.warning(
+                                    f"Translation result is too long or too short. Input: {input_token_count}, Output: {output_token_count}"
+                                )
+                                llm_translate_tracker.set_placeholder_full_match()
+                                continue
 
                     if not self.translation_config.disable_same_text_fallback:
                         edit_distance = Levenshtein.distance(
@@ -850,8 +888,8 @@ class ILTranslatorLLMOnly:
                         self.ok_count += 1
 
         except Exception as e:
-            error_message = f"Error {e} during translation. try fallback"
-            logger.warning(error_message)
+            error_message = "Batch JSON translation failed, falling back to per-paragraph translation"
+            logger.info(error_message)
             for llm_translate_tracker in llm_translate_trackers:
                 llm_translate_tracker.set_error_message(error_message)
                 llm_translate_tracker.set_fallback_to_translate()
@@ -982,8 +1020,8 @@ class ILTranslatorLLMOnly:
             lang_out=self.translation_config.lang_out,
         )
 
-    def _clean_json_output(self, llm_output: str) -> str:
-        # Clean up JSON output by removing common wrapper tags
+    @staticmethod
+    def _clean_json_output(llm_output: str) -> str:
         llm_output = llm_output.strip()
         if llm_output.startswith("<json>"):
             llm_output = llm_output[6:]
@@ -995,4 +1033,49 @@ class ILTranslatorLLMOnly:
             llm_output = llm_output[3:]
         if llm_output.endswith("```"):
             llm_output = llm_output[:-3]
+        llm_output = llm_output.strip()
+        first_brace = llm_output.find('{')
+        first_bracket = llm_output.find('[')
+        start = -1
+        if first_brace == -1 and first_bracket == -1:
+            return llm_output
+        if first_brace == -1:
+            start = first_bracket
+        elif first_bracket == -1:
+            start = first_brace
+        else:
+            start = min(first_brace, first_bracket)
+        if start > 0:
+            llm_output = llm_output[start:]
         return llm_output.strip()
+
+    @staticmethod
+    def _robust_json_decode(text: str):
+        """鲁棒 JSON 解析：处理 {obj1}{obj2} 拼接、自然语言包裹等边界情况"""
+        import json as _json
+        decoder = _json.JSONDecoder()
+        objs = []
+        idx = 0
+        text = text.strip()
+        while idx < len(text):
+            while idx < len(text) and text[idx] in ' \t\n\r':
+                idx += 1
+            if idx >= len(text):
+                break
+            try:
+                obj, idx = decoder.raw_decode(text, idx)
+                objs.append(obj)
+            except _json.JSONDecodeError:
+                idx += 1
+                continue
+        if not objs:
+            return None
+        if len(objs) == 1:
+            return objs[0] if isinstance(objs[0], list) else [objs[0]]
+        result = []
+        for obj in objs:
+            if isinstance(obj, list):
+                result.extend(obj)
+            else:
+                result.append(obj)
+        return result

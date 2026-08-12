@@ -969,6 +969,8 @@ class Typesetting:
         min_scale = 0.1
         expand_space_flag = 0
         final_typeset_units = None
+        best_fallback_units = None
+        best_fallback_scale = None
 
         while scale >= min_scale:
             try:
@@ -1000,6 +1002,9 @@ class Typesetting:
                                 page.pdf_form.append(form)
                         final_typeset_units = typeset_units
                     return scale, final_typeset_units
+                elif typeset_units:
+                    best_fallback_units = typeset_units
+                    best_fallback_scale = scale
             except Exception:
                 # 如果布局检查出错，继续尝试下一个缩放因子
                 pass
@@ -1063,7 +1068,7 @@ class Typesetting:
 
         # 如果仍然放不下，尝试去除英文换行限制
         if use_english_line_break:
-            return self._find_optimal_scale_and_layout(
+            recursive_scale, recursive_units = self._find_optimal_scale_and_layout(
                 paragraph,
                 page,
                 typesetting_units,
@@ -1071,6 +1076,31 @@ class Typesetting:
                 use_english_line_break=False,
                 apply_layout=apply_layout,
             )
+            if recursive_units is not None:
+                return recursive_scale, recursive_units
+
+        # 兜底：如果始终放不下，使用最后一次计算的布局，确保内容不丢失
+        if final_typeset_units is None and best_fallback_units is not None:
+            if apply_layout:
+                paragraph.scale = best_fallback_scale
+                paragraph.pdf_paragraph_composition = []
+                for unit in best_fallback_units:
+                    chars, curves, forms = unit.render()
+                    for char in chars:
+                        paragraph.pdf_paragraph_composition.append(
+                            PdfParagraphComposition(pdf_character=char),
+                        )
+                    for curve in curves:
+                        page.pdf_curve.append(curve)
+                    for form in forms:
+                        page.pdf_form.append(form)
+                final_typeset_units = best_fallback_units
+            logger.warning(
+                f"Paragraph {getattr(paragraph, 'debug_id', '?')} overflow at "
+                f"scale={best_fallback_scale:.2f}, applying fallback layout "
+                f"(text may overlap but will not be lost)."
+            )
+            return best_fallback_scale, final_typeset_units
 
         # 最后返回最小缩放因子
         return min_scale, final_typeset_units
@@ -1553,12 +1583,19 @@ class Typesetting:
                     f"Paragraph: {paragraph}. ",
                 )
                 continue
+        filtered_count = len(result)
         result = list(
             filter(
                 lambda x: x.unicode is None or x.font is not None,
                 result,
             ),
         )
+        dropped_count = filtered_count - len(result)
+        if dropped_count > 0:
+            logger.warning(
+                f"Paragraph {getattr(paragraph, 'debug_id', '?')}: "
+                f"{dropped_count} characters dropped due to missing font mapping."
+            )
 
         if any(x.width < 0 for x in result):
             logger.warning("有排版单元宽度小于 0，请检查字体映射是否正确。")

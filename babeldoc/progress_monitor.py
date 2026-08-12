@@ -144,7 +144,7 @@ class ProgressMonitor:
         if self.finish_event and self.loop:
             self.loop.call_soon_threadsafe(self.finish_event.set)
         if self.cancel_event and self.cancel_event.is_set():
-            self.finish_callback(type="error", error=CancelledError)
+            self.finish_callback(type="error", error="翻译已取消 (CancelledError)")
 
     def stage_done(self, stage):
         if self.disable or self.parent_monitor and self.parent_monitor.disable:

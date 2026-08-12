@@ -1,0 +1,1 @@
+"""BabelDOC GUI 模块"""
