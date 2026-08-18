@@ -554,8 +554,10 @@ class TerminologyManager:
 
 if __name__ == "__main__":
     import tempfile
-    
-    print("=== TBX Parser Test ===")
+    import logging
+    _logger = logging.getLogger(__name__)
+
+    _logger.info("=== TBX Parser Test ===")
     # 创建测试 TBX 文件
     tbx_content = '''<?xml version="1.0" encoding="UTF-8"?>
     <martif type="TBX" xml:lang="en">
@@ -572,54 +574,54 @@ if __name__ == "__main__":
             </body>
         </text>
     </martif>'''
-    
+
     with tempfile.NamedTemporaryFile(suffix=".tbx", delete=False, mode='w', encoding='utf-8') as f:
         f.write(tbx_content)
         tbx_path = f.name
-    
+
     terms = TBXParser.parse(tbx_path, "en", "zh")
-    print(f"TBX parsed: {len(terms)} terms")
+    _logger.info("TBX parsed: %d terms", len(terms))
     for term, trans in terms[:3]:
-        print(f"  {term} -> {trans}")
-    
+        _logger.info("  %s -> %s", term, trans)
+
     Path(tbx_path).unlink()
-    
-    print("\n=== CSV Parser Test ===")
+
+    _logger.info("=== CSV Parser Test ===")
     csv_content = """Term,Translation
 Machine Learning,机器学习
 Deep Learning,深度学习
 Neural Network,神经网络
 """
-    
+
     with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode='w', encoding='utf-8', newline='') as f:
         f.write(csv_content)
         csv_path = f.name
-    
+
     terms = CSVParser.parse(csv_path, "en", "zh")
-    print(f"CSV parsed: {len(terms)} terms")
+    _logger.info("CSV parsed: %d terms", len(terms))
     for term, trans in terms:
-        print(f"  {term} -> {trans}")
-    
+        _logger.info("  %s -> %s", term, trans)
+
     Path(csv_path).unlink()
-    
-    print("\n=== Similarity Matcher Test ===")
+
+    _logger.info("=== Similarity Matcher Test ===")
     matcher = SimilarityMatcher()
-    
+
     test_pairs = [
         ("Machine Learning", "Machine Learning"),
         ("Machine Learning", "Machine Learnin"),
         ("Deep Learning", "Machine Learning"),
         ("Hello World", "Hello World!"),
     ]
-    
+
     for t1, t2 in test_pairs:
         sim = matcher.calculate_similarity(t1, t2)
-        print(f"  '{t1}' vs '{t2}': {sim:.2%}")
-    
-    print("\n=== FTS5 Search Test ===")
+        _logger.info("  '%s' vs '%s': %.2f%%", t1, t2, sim * 100)
+
+    _logger.info("=== FTS5 Search Test ===")
     db_dir = tempfile.mkdtemp()
     db_path = Path(db_dir) / "test.db"
-    
+
     fts = FTS5SearchEngine(db_path)
     test_entries = [
         ("Machine Learning is great", "机器学习很棒"),
@@ -627,17 +629,17 @@ Neural Network,神经网络
         ("Neural Network", "神经网络"),
         ("Natural Language Processing", "自然语言处理"),
     ]
-    
+
     fts.index_entries(test_entries)
     results = fts.search("Machine", 5)
-    print(f"FTS5 search 'Machine': {len(results)} results")
+    _logger.info("FTS5 search 'Machine': %d results", len(results))
     for src, tgt, rank in results:
-        print(f"  {src} -> {tgt}")
-    
+        _logger.info("  %s -> %s", src, tgt)
+
     fts.close()
-    
+
     # 清理
     import shutil
     shutil.rmtree(db_dir, ignore_errors=True)
-    
-    print("\n=== All Tests Passed ===")
+
+    _logger.info("=== All Tests Passed ===")

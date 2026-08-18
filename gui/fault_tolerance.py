@@ -430,14 +430,17 @@ def get_shutdown_manager() -> SafeShutdownManager:
 
 
 if __name__ == "__main__":
+    import logging
+    _logger = logging.getLogger(__name__)
+
     # 测试指数退避
-    print("=== 指数退避重试测试 ===")
-    
+    _logger.info("=== 指数退避重试测试 ===")
+
     call_count = 0
-    
+
     @retry_with_backoff(
         config=RetryConfig(max_retries=3, base_delay=1.0),
-        on_retry=lambda attempt, delay, err: print(f"  第 {attempt} 次重试，等待 {delay:.1f}s")
+        on_retry=lambda attempt, delay, err: _logger.info("  第 %d 次重试，等待 %.1fs", attempt, delay)
     )
     def flaky_api():
         global call_count
@@ -445,26 +448,26 @@ if __name__ == "__main__":
         if call_count < 3:
             raise Exception("429 Too Many Requests")
         return "成功"
-    
+
     result = flaky_api()
-    print(f"结果: {result}")
-    
+    _logger.info("结果: %s", result)
+
     # 测试心跳
-    print("\n=== 心跳看门狗测试 ===")
+    _logger.info("=== 心跳看门狗测试 ===")
     watchdog = HeartbeatWatchdog(timeout=5.0)
     watchdog.start()
-    
+
     for i in range(6):
         time.sleep(1)
         if i % 2 == 0:
             watchdog.heartbeat()
-            print(f"  [{i}s] 心跳已发送")
+            _logger.info("  [%ds] 心跳已发送", i)
         alive = watchdog.is_alive()
-        print(f"  [{i}s] 存活: {alive}, 距离上次心跳: {watchdog.get_elapsed():.1f}s")
-    
+        _logger.info("  [%ds] 存活: %s, 距离上次心跳: %.1fs", i, alive, watchdog.get_elapsed())
+
     # 测试文件解锁
-    print("\n=== 文件解锁测试 ===")
+    _logger.info("=== 文件解锁测试 ===")
     FileUnlockManager.release_all_handles()
-    print("垃圾回收完成")
-    
-    print("\n所有容错机制测试通过")
+    _logger.info("垃圾回收完成")
+
+    _logger.info("所有容错机制测试通过")

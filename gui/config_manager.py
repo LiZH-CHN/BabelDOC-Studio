@@ -5,12 +5,15 @@ r"""
 - 记住上次会话的所有配置
 """
 
-import os
 import base64
+import logging
+import os
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
-from dataclasses import dataclass, field, asdict
+from typing import Optional, Dict, List, Any
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -18,7 +21,15 @@ from dataclasses import dataclass, field, asdict
 # ============================================================
 
 def get_config_dir() -> Path:
-    """获取配置目录"""
+    """获取配置目录。
+
+    根据操作系统返回对应的配置目录路径：
+    - Windows: %APPDATA%\\BabelDOC-GUI
+    - macOS/Linux: ~/.config/babeldoc-gui
+
+    Returns:
+        配置目录路径
+    """
     if os.name == 'nt':  # Windows
         appdata = os.environ.get('APPDATA', Path.home() / 'AppData' / 'Roaming')
         config_dir = Path(appdata) / 'BabelDOC-GUI'
@@ -30,13 +41,95 @@ def get_config_dir() -> Path:
 
 
 def get_config_path() -> Path:
-    """获取配置文件路径"""
+    """获取配置文件路径。
+
+    Returns:
+        配置文件完整路径
+    """
     return get_config_dir() / 'config.toml'
 
 
 # ============================================================
-# 简单加密（XOR + Base64）
+# 安全存储（使用 keyring 或回退到简单加密）
 # ============================================================
+
+class SecureStorage:
+    """
+    安全存储管理器
+    优先使用 keyring（系统密钥存储），不可用时回退到 SimpleEncryptor
+    """
+
+    def __init__(self) -> None:
+        self._keyring_available: bool = False
+        self._encryptor: SimpleEncryptor = SimpleEncryptor()
+        self._keyring: Any = None
+
+        try:
+            import keyring
+
+            self._keyring = keyring
+            self._keyring_available = True
+            # 测试 keyring 是否可用
+            keyring.get_password("BabelDOC-GUI", "__test__")
+        except Exception:
+            self._keyring_available = False
+
+    def save_secret(self, name: str, value: str) -> bool:
+        """安全保存 API Key。
+
+        优先使用 keyring 存储，失败时返回 False。
+
+        Args:
+            name: 密钥名称
+            value: 密钥值
+
+        Returns:
+            是否保存成功
+        """
+        if self._keyring_available:
+            try:
+                self._keyring.set_password("BabelDOC-GUI", name, value)
+                return True
+            except Exception:
+                pass
+        # 回退：使用 SimpleEncryptor 加密后保存到配置文件
+        return False
+
+    def get_secret(self, name: str) -> Optional[str]:
+        """安全读取 API Key。
+
+        Args:
+            name: 密钥名称
+
+        Returns:
+            密钥值，不存在时返回 None
+        """
+        if self._keyring_available:
+            try:
+                value = self._keyring.get_password("BabelDOC-GUI", name)
+                if value:
+                    return value
+            except Exception:
+                pass
+        return None
+
+    def delete_secret(self, name: str) -> bool:
+        """删除 API Key。
+
+        Args:
+            name: 密钥名称
+
+        Returns:
+            是否删除成功
+        """
+        if self._keyring_available:
+            try:
+                self._keyring.delete_password("BabelDOC-GUI", name)
+                return True
+            except Exception:
+                pass
+        return False
+
 
 class SimpleEncryptor:
     """
@@ -46,15 +139,24 @@ class SimpleEncryptor:
     生产环境建议使用 Windows Credential Manager 或 keyring
     """
 
-    def __init__(self, key: str = None):
+    def __init__(self, key: Optional[str] = None) -> None:
         if key is None:
             # 使用机器特定的密钥（基于用户名和机器名）
             import platform
             key = f"{platform.node()}-{os.getlogin()}-BabelDOC-2024"
-        self.key = key
+        self.key: str = key
 
     def encrypt(self, plaintext: str) -> str:
-        """加密"""
+        """加密字符串。
+
+        使用 XOR + Base64 编码对明文进行加密。
+
+        Args:
+            plaintext: 明文字符串
+
+        Returns:
+            加密后的 Base64 编码字符串
+        """
         if not plaintext:
             return ""
 
@@ -70,7 +172,16 @@ class SimpleEncryptor:
         return base64.b64encode(bytes(encrypted)).decode('utf-8')
 
     def decrypt(self, ciphertext: str) -> str:
-        """解密"""
+        """解密字符串。
+
+        使用 Base64 解码 + XOR 对密文进行解密。
+
+        Args:
+            ciphertext: 加密后的 Base64 编码字符串
+
+        Returns:
+            解密后的明文字符串，失败时返回空字符串
+        """
         if not ciphertext:
             return ""
 
@@ -236,12 +347,14 @@ class LastSession:
     enable_qa: bool = True
     enable_ocr: bool = False
     enable_multi_engine: bool = False
+    skip_references: bool = True
     engine2_model: str = ""
     multi_strategy: str = "balanced"
     output_dir: str = ""
     window_width: int = 900
     window_height: int = 700
     last_used: float = 0.0
+    auto_open_output_dir: bool = True
 
 
 @dataclass
@@ -272,16 +385,37 @@ class ConfigManager:
     负责加载、保存、加密/解密配置
     """
 
-    def __init__(self):
-        self.config_path = get_config_path()
-        self.config_dir = get_config_dir()
-        self.encryptor = SimpleEncryptor()
-        self.win_cred = WindowsCredentialManager()
-        self.config = AppConfig()
+    def __init__(self) -> None:
+        self.config_path: Path = get_config_path()
+        self.config_dir: Path = get_config_dir()
+        self.encryptor: SimpleEncryptor = SimpleEncryptor()
+        self.win_cred: WindowsCredentialManager = WindowsCredentialManager()
+        self.config: AppConfig = AppConfig()
         self._load()
 
-    def _load(self):
-        """加载配置"""
+    def _load_api_key(self, encrypted_key: str) -> str:
+        """加载 API Key（优先从 Windows 凭据管理器读取，否则解密）
+
+        Args:
+            encrypted_key: 加密的 API Key
+
+        Returns:
+            解密后的 API Key
+        """
+        # 优先从 Windows 凭据管理器读取
+        if self.win_cred.available:
+            cred = self.win_cred.read_credential('api_key')
+            if cred:
+                return cred
+
+        # 回退到解密
+        if encrypted_key:
+            return self.encryptor.decrypt(encrypted_key)
+
+        return ""
+
+    def _load(self) -> None:
+        """加载配置文件到内存"""
         if not self.config_path.exists():
             self.config = AppConfig()
             return
@@ -312,12 +446,14 @@ class ConfigManager:
                 enable_qa=ls_data.get('enable_qa', True),
                 enable_ocr=ls_data.get('enable_ocr', False),
                 enable_multi_engine=ls_data.get('enable_multi_engine', False),
+                skip_references=ls_data.get('skip_references', True),
                 engine2_model=ls_data.get('engine2_model', ''),
                 multi_strategy=ls_data.get('multi_strategy', 'balanced'),
                 output_dir=ls_data.get('output_dir', ''),
                 window_width=ls_data.get('window_width', 900),
                 window_height=ls_data.get('window_height', 700),
                 last_used=ls_data.get('last_used', 0.0),
+                auto_open_output_dir=ls_data.get('auto_open_output_dir', True),
             )
 
             # 解析 CustomProviders
@@ -334,14 +470,27 @@ class ConfigManager:
             self.config.theme = data.get('theme', 'light')
 
         except Exception as e:
-            print(f"加载配置失败: {e}，使用默认配置")
+            logger.error("加载配置失败: %s，使用默认配置", e)
             self.config = AppConfig()
 
-    def save(self):
-        """保存配置"""
+    def save(self) -> bool:
+        """保存配置到文件。
+
+        API Key 优先保存到 Windows 凭据管理器，否则加密存储。
+
+        Returns:
+            是否保存成功
+        """
         try:
-            # 加密 API Key
-            encrypted_key = self._save_api_key(self.config.last_session.api_key)
+            # 优先将 API Key 保存到 Windows 凭据管理器
+            api_key = self.config.last_session.api_key
+            if api_key and self.win_cred.available:
+                self.win_cred.save_credential('api_key', api_key)
+                # 保存成功后，配置文件中只保存占位符
+                encrypted_key = "***"
+            else:
+                # 回退到加密存储
+                encrypted_key = self.encryptor.encrypt(api_key)
 
             data = {
                 'LastSession': {
@@ -357,12 +506,14 @@ class ConfigManager:
                     'enable_qa': self.config.last_session.enable_qa,
                     'enable_ocr': self.config.last_session.enable_ocr,
                     'enable_multi_engine': self.config.last_session.enable_multi_engine,
+                    'skip_references': self.config.last_session.skip_references,
                     'engine2_model': self.config.last_session.engine2_model,
                     'multi_strategy': self.config.last_session.multi_strategy,
                     'output_dir': self.config.last_session.output_dir,
                     'window_width': self.config.last_session.window_width,
                     'window_height': self.config.last_session.window_height,
                     'last_used': time.time(),
+                    'auto_open_output_dir': self.config.last_session.auto_open_output_dir,
                 },
                 'CustomProviders': {
                     'urls': self.config.custom_providers.urls,
@@ -388,40 +539,15 @@ class ConfigManager:
             return True
 
         except Exception as e:
-            print(f"保存配置失败: {e}")
+            logger.error("保存配置失败: %s", e)
             return False
 
-    def _save_api_key(self, api_key: str) -> str:
-        """保存 API Key（加密）"""
-        if not api_key:
-            return ""
+    def update_last_session(self, **kwargs: Any) -> None:
+        """更新上次会话配置。
 
-        # 优先使用 Windows 凭据管理器
-        if self.win_cred.available:
-            if self.win_cred.save_credential('api_key', api_key):
-                return "__WIN_CRED__"
-
-        # 回退到简单加密
-        return self.encryptor.encrypt(api_key)
-
-    def _load_api_key(self, stored: str) -> str:
-        """加载 API Key（解密）"""
-        if not stored:
-            return ""
-
-        if stored == "__WIN_CRED__":
-            # 从 Windows 凭据管理器读取
-            if self.win_cred.available:
-                key = self.win_cred.read_credential('api_key')
-                if key:
-                    return key
-            return ""
-
-        # 解密
-        return self.encryptor.decrypt(stored)
-
-    def update_last_session(self, **kwargs):
-        """更新上次会话配置"""
+        Args:
+            **kwargs: 要更新的字段键值对
+        """
         for key, value in kwargs.items():
             if hasattr(self.config.last_session, key):
                 setattr(self.config.last_session, key, value)
@@ -430,8 +556,12 @@ class ConfigManager:
         if self.config.auto_save:
             self.save()
 
-    def add_recent_file(self, file_path: str):
-        """添加最近文件"""
+    def add_recent_file(self, file_path: str) -> None:
+        """添加最近文件（最多保留 10 个）。
+
+        Args:
+            file_path: 文件路径
+        """
         if file_path in self.config.recent_files:
             self.config.recent_files.remove(file_path)
         self.config.recent_files.insert(0, file_path)
@@ -440,18 +570,30 @@ class ConfigManager:
         if self.config.auto_save:
             self.save()
 
-    def set_custom_provider_url(self, provider: str, url: str):
-        """设置自定义供应商 URL"""
+    def set_custom_provider_url(self, provider: str, url: str) -> None:
+        """设置自定义供应商 URL。
+
+        Args:
+            provider: 供应商名称
+            url: 供应商 Base URL
+        """
         self.config.custom_providers.urls[provider] = url
         if self.config.auto_save:
             self.save()
 
     def get_custom_provider_url(self, provider: str) -> Optional[str]:
-        """获取自定义供应商 URL"""
+        """获取自定义供应商 URL。
+
+        Args:
+            provider: 供应商名称
+
+        Returns:
+            供应商 Base URL，不存在时返回 None
+        """
         return self.config.custom_providers.urls.get(provider)
 
-    def clear_all(self):
-        """清除所有配置"""
+    def clear_all(self) -> None:
+        """清除所有配置（包括 Windows 凭据）"""
         self.config = AppConfig()
         if self.config_path.exists():
             self.config_path.unlink()
@@ -460,8 +602,12 @@ class ConfigManager:
         if self.win_cred.available:
             self.win_cred.delete_credential('api_key')
 
-    def export_config(self, filepath: str):
-        """导出配置（不含 API Key）"""
+    def export_config(self, filepath: str) -> None:
+        """导出配置（不含 API Key）。
+
+        Args:
+            filepath: 导出文件路径
+        """
         data = {
             'LastSession': {
                 'provider': self.config.last_session.provider,
@@ -486,8 +632,15 @@ class ConfigManager:
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
 
-    def import_config(self, filepath: str):
-        """导入配置"""
+    def import_config(self, filepath: str) -> bool:
+        """导入配置。
+
+        Args:
+            filepath: 导入文件路径
+
+        Returns:
+            是否导入成功
+        """
         try:
             try:
                 import toml
@@ -533,31 +686,34 @@ def get_config() -> ConfigManager:
 
 if __name__ == "__main__":
     # 测试
+    from gui.logger_utils import get_logger
+    _logger = get_logger(__name__)
+
     config = get_config()
 
-    print(f"配置目录: {get_config_dir()}")
-    print(f"配置文件: {get_config_path()}")
-    print(f"当前模型: {config.config.last_session.model}")
-    print(f"当前语言: {config.config.last_session.lang_in} → {config.config.last_session.lang_out}")
+    _logger.info("配置目录: %s", get_config_dir())
+    _logger.info("配置文件: %s", get_config_path())
+    _logger.info("当前模型: %s", config.config.last_session.model)
+    _logger.info("当前语言: %s → %s", config.config.last_session.lang_in, config.config.last_session.lang_out)
 
     # 测试加密
     encryptor = SimpleEncryptor()
     test_key = "sk-test-api-key-12345"
     encrypted = encryptor.encrypt(test_key)
     decrypted = encryptor.decrypt(encrypted)
-    print(f"\n加密测试:")
-    print(f"  原文: {test_key}")
-    print(f"  加密: {encrypted[:30]}...")
-    print(f"  解密: {decrypted}")
-    print(f"  匹配: {test_key == decrypted}")
+    _logger.info("加密测试:")
+    _logger.info("  原文: %s", test_key)
+    _logger.info("  加密: %s...", encrypted[:30])
+    _logger.info("  解密: %s", decrypted)
+    _logger.info("  匹配: %s", test_key == decrypted)
 
     # 测试保存
     config.config.last_session.model = "glm-4.7"
     config.config.last_session.api_key = "sk-test-key"
     config.save()
-    print(f"\n配置已保存")
+    _logger.info("配置已保存")
 
     # 测试加载
     config2 = ConfigManager()
-    print(f"加载后模型: {config2.config.last_session.model}")
-    print(f"加载后 Key: {config2.config.last_session.api_key}")
+    _logger.info("加载后模型: %s", config2.config.last_session.model)
+    _logger.info("加载后 Key: %s", config2.config.last_session.api_key)

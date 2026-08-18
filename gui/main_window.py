@@ -1,8 +1,13 @@
 """主窗口模块"""
-from datetime import datetime
+import threading
+import time
+import traceback
+import logging
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, Dict, List, Any
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject
 from PyQt6.QtGui import QFont, QIcon, QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -12,10 +17,13 @@ from PyQt6.QtWidgets import (
     QApplication, QSplitter
 )
 
-from babeldoc.translator.translator import OpenAITranslator
+from babeldoc.translator.translator import OpenAITranslator, parse_context_length
+from gui.config_manager import get_config, ConfigManager
+from gui.preset_models import get_preset_models, get_model_config
 from gui.quality_dialogs import QualityDialog
-from gui.core import TermInjector, create_default_replacer, SmartTermMatcher
+from gui.translation_worker import TranslationWorker
 from gui.core import (
+    TermInjector, create_default_replacer, SmartTermMatcher,
     CostAnalyzer, MultiEngineTranslator, AdaptiveMT, ImageTranslator,
     MODEL_PRICING
 )
@@ -23,548 +31,92 @@ from gui.fault_tolerance import (
     HeartbeatWatchdog, WorkerHeartbeat, APIGuardian,
     FileUnlockManager, SafeShutdownManager, DEFAULT_RETRY_CONFIG
 )
+from gui.notify import send_notification
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
 # ============================================================
-# 预设模型配置（按供应商分组）- 基于各平台最新 API 文档
+# 窗口尺寸常量
 # ============================================================
-PRESET_MODELS = {
-    # ==================== DeepSeek ====================
-    "DeepSeek-V4-Pro": {
-        "model": "deepseek-v4-pro",
-        "base_url": "https://api.deepseek.com/v1",
-        "provider": "DeepSeek",
-        "context": "1M",
-        "note": "旗舰级，1.6T MoE，49B 激活",
-    },
-    "DeepSeek-V4-Flash": {
-        "model": "deepseek-v4-flash",
-        "base_url": "https://api.deepseek.com/v1",
-        "provider": "DeepSeek",
-        "context": "1M",
-        "note": "快速模式，284B MoE，13B 激活",
-    },
-    "DeepSeek-V3-0324": {
-        "model": "deepseek-v3-0324",
-        "base_url": "https://api.deepseek.com/v1",
-        "provider": "DeepSeek",
-        "context": "64K",
-        "note": "V3 系列稳定版",
-    },
-    "DeepSeek-R1-0528": {
-        "model": "deepseek-r1-0528",
-        "base_url": "https://api.deepseek.com/v1",
-        "provider": "DeepSeek",
-        "context": "64K",
-        "note": "R1 推理系列",
-    },
-    "DeepSeek-V3.1-Terminus": {
-        "model": "deepseek-v3.1-terminus",
-        "base_url": "https://api.deepseek.com/v1",
-        "provider": "DeepSeek",
-        "context": "64K",
-        "note": "V3.1 终版",
-    },
-    # ==================== GLM (智谱) ====================
-    "GLM-5.2": {
-        "model": "glm-5.2",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "provider": "GLM",
-        "context": "1M",
-        "note": "最新旗舰，Coding 开源 SOTA",
-    },
-    "GLM-5.1": {
-        "model": "glm-5.1",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "provider": "GLM",
-        "context": "200K",
-        "note": "Coding 对齐 Claude Opus 4.6",
-    },
-    "GLM-5": {
-        "model": "glm-5",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "provider": "GLM",
-        "context": "200K",
-        "note": "编程对齐 Claude Opus 4.5",
-    },
-    "GLM-5-Turbo": {
-        "model": "glm-5-turbo",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "provider": "GLM",
-        "context": "200K",
-        "note": "复杂长任务优化",
-    },
-    "GLM-4.7": {
-        "model": "glm-4.7",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "provider": "GLM",
-        "context": "200K",
-        "note": "通用对话/推理/智能体",
-    },
-    "GLM-4.7-Flash": {
-        "model": "glm-4.7-flash",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "provider": "GLM",
-        "context": "200K",
-        "note": "轻量高速版本",
-    },
-    "GLM-4.7-FlashX": {
-        "model": "glm-4.7-flashx",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "provider": "GLM",
-        "context": "200K",
-        "note": "小尺寸强能力，写作/翻译",
-    },
-    "GLM-4.6": {
-        "model": "glm-4.6",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "provider": "GLM",
-        "context": "200K",
-        "note": "高级编码/复杂推理",
-    },
-    "GLM-4.5-Air": {
-        "model": "glm-4.5-air",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "provider": "GLM",
-        "context": "128K",
-        "note": "高性价比轻量模型",
-    },
-    "GLM-4.5-AirX": {
-        "model": "glm-4.5-airx",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "provider": "GLM",
-        "context": "128K",
-        "note": "高性价比极速版",
-    },
-    # === GLM 视觉模型 ===
-    "GLM-5V-Turbo": {
-        "model": "glm-5v-turbo",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "provider": "GLM-Vision",
-        "context": "200K",
-        "note": "多模态 Coding",
-    },
-    "GLM-4.6V": {
-        "model": "glm-4.6v",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "provider": "GLM-Vision",
-        "context": "128K",
-        "note": "视觉语言模型",
-    },
-    "GLM-4.6V-FP8": {
-        "model": "glm-4.6v-fp8",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "provider": "GLM-Vision",
-        "context": "128K",
-        "note": "视觉模型量化版",
-    },
-    "GLM-4.1V-Thinking": {
-        "model": "glm-4.1v-thinking",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "provider": "GLM-Vision",
-        "context": "128K",
-        "note": "视觉推理模型",
-    },
-    "GLM-OCR": {
-        "model": "glm-ocr",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "provider": "GLM-Vision",
-        "context": "128K",
-        "note": "OCR 专用模型",
-    },
-    # ==================== Kimi (月之暗面) ====================
-    "Kimi-K3": {
-        "model": "kimi-k3",
-        "base_url": "https://api.moonshot.cn/v1",
-        "provider": "Kimi",
-        "context": "1M",
-        "note": "旗舰，2.8T 参数，原生视觉",
-    },
-    "Kimi-K2.7-Code": {
-        "model": "kimi-k2.7-code",
-        "base_url": "https://api.moonshot.cn/v1",
-        "provider": "Kimi",
-        "context": "256K",
-        "note": "Coding 模型，长上下文指令遵循",
-    },
-    "Kimi-K2.7-Code-Highspeed": {
-        "model": "kimi-k2.7-code-highspeed",
-        "base_url": "https://api.moonshot.cn/v1",
-        "provider": "Kimi",
-        "context": "256K",
-        "note": "高速版，~180 Tokens/s",
-    },
-    "Kimi-K2.6": {
-        "model": "kimi-k2.6",
-        "base_url": "https://api.moonshot.cn/v1",
-        "provider": "Kimi",
-        "context": "256K",
-        "note": "视觉+文本，思考/非思考模式",
-    },
-    "Moonshot-V1-8K": {
-        "model": "moonshot-v1-8k",
-        "base_url": "https://api.moonshot.cn/v1",
-        "provider": "Kimi",
-        "context": "8K",
-        "note": "短文本生成",
-    },
-    "Moonshot-V1-32K": {
-        "model": "moonshot-v1-32k",
-        "base_url": "https://api.moonshot.cn/v1",
-        "provider": "Kimi",
-        "context": "32K",
-        "note": "长文本生成",
-    },
-    "Moonshot-V1-128K": {
-        "model": "moonshot-v1-128k",
-        "base_url": "https://api.moonshot.cn/v1",
-        "provider": "Kimi",
-        "context": "128K",
-        "note": "超长文本生成",
-    },
-    "Moonshot-V1-8K-Vision": {
-        "model": "moonshot-v1-8k-vision-preview",
-        "base_url": "https://api.moonshot.cn/v1",
-        "provider": "Kimi",
-        "context": "8K",
-        "note": "视觉模型",
-    },
-    "Moonshot-V1-32K-Vision": {
-        "model": "moonshot-v1-32k-vision-preview",
-        "base_url": "https://api.moonshot.cn/v1",
-        "provider": "Kimi",
-        "context": "32K",
-        "note": "视觉模型",
-    },
-    "Moonshot-V1-128K-Vision": {
-        "model": "moonshot-v1-128k-vision-preview",
-        "base_url": "https://api.moonshot.cn/v1",
-        "provider": "Kimi",
-        "context": "128K",
-        "note": "视觉模型",
-    },
-    # ==================== OpenAI ====================
-    "GPT-5.6-Sol": {
-        "model": "gpt-5.6-sol",
-        "base_url": "https://api.openai.com/v1",
-        "provider": "OpenAI",
-        "context": "1M",
-        "note": "旗舰，复杂推理与编码",
-    },
-    "GPT-5.6-Terra": {
-        "model": "gpt-5.6-terra",
-        "base_url": "https://api.openai.com/v1",
-        "provider": "OpenAI",
-        "context": "1M",
-        "note": "均衡，智能与成本平衡",
-    },
-    "GPT-5.6-Luna": {
-        "model": "gpt-5.6-luna",
-        "base_url": "https://api.openai.com/v1",
-        "provider": "OpenAI",
-        "context": "1M",
-        "note": "轻量，成本敏感高吞吐",
-    },
-    "GPT-5.5-Pro": {
-        "model": "gpt-5.5-pro",
-        "base_url": "https://api.openai.com/v1",
-        "provider": "OpenAI",
-        "context": "1M",
-        "note": "专业版",
-    },
-    "GPT-5.4-Mini": {
-        "model": "gpt-5.4-mini",
-        "base_url": "https://api.openai.com/v1",
-        "provider": "OpenAI",
-        "context": "512K",
-        "note": "小型模型",
-    },
-    "GPT-5.4-Nano": {
-        "model": "gpt-5.4-nano",
-        "base_url": "https://api.openai.com/v1",
-        "provider": "OpenAI",
-        "context": "256K",
-        "note": "纳米级模型",
-    },
-    "GPT-5.3-Codex": {
-        "model": "gpt-5.3-codex",
-        "base_url": "https://api.openai.com/v1",
-        "provider": "OpenAI",
-        "context": "1M",
-        "note": "最强 Agentic 编码模型",
-    },
-    "GPT-5.2-Codex": {
-        "model": "gpt-5.2-codex",
-        "base_url": "https://api.openai.com/v1",
-        "provider": "OpenAI",
-        "context": "1M",
-        "note": "编码模型",
-    },
-    "O3-Pro": {
-        "model": "o3-pro",
-        "base_url": "https://api.openai.com/v1",
-        "provider": "OpenAI",
-        "context": "200K",
-        "note": "最强推理模型",
-    },
-    "GPT-4.1": {
-        "model": "gpt-4.1",
-        "base_url": "https://api.openai.com/v1",
-        "provider": "OpenAI",
-        "context": "1M",
-        "note": "最强非推理模型",
-    },
-    "GPT-4.1-Mini": {
-        "model": "gpt-4.1-mini",
-        "base_url": "https://api.openai.com/v1",
-        "provider": "OpenAI",
-        "context": "512K",
-        "note": "小型快速版本",
-    },
-    "GPT-4o": {
-        "model": "gpt-4o",
-        "base_url": "https://api.openai.com/v1",
-        "provider": "OpenAI",
-        "context": "128K",
-        "note": "快速智能 GPT",
-    },
-    "GPT-4o-Mini": {
-        "model": "gpt-4o-mini",
-        "base_url": "https://api.openai.com/v1",
-        "provider": "OpenAI",
-        "context": "128K",
-        "note": "小型专注模型",
-    },
-    # ==================== 通义千问 (阿里) ====================
-    "Qwen3-Max": {
-        "model": "qwen3-max",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "256K",
-        "note": "通用旗舰，推理能力最强",
-    },
-    "Qwen3.7-Max": {
-        "model": "qwen3.7-max",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "256K",
-        "note": "推荐模型",
-    },
-    "Qwen3.8-Max": {
-        "model": "qwen3.8-max",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "256K",
-        "note": "原生视觉语言旗舰",
-    },
-    "Qwen3.7-Plus": {
-        "model": "qwen3.7-plus",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "1M",
-        "note": "推荐模型",
-    },
-    "Qwen-Plus": {
-        "model": "qwen-plus",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "1M",
-        "note": "性价比之王，日常通用",
-    },
-    "Qwen3.6-Plus-Preview": {
-        "model": "qwen3.6-plus-preview",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "1M",
-        "note": "Agent/长上下文，最新预览",
-    },
-    "Qwen3.5-Plus": {
-        "model": "qwen3.5-plus",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "1M",
-        "note": "通用模型",
-    },
-    "Qwen3.5-397B-A17B": {
-        "model": "qwen3.5-397b-a17b",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "256K",
-        "note": "视觉-语言多模态旗舰",
-    },
-    "Qwen3.5-122-A10B": {
-        "model": "qwen3.5-122-a10b",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "中型尺寸",
-    },
-    "Qwen3.5-35B-A3B": {
-        "model": "qwen3.5-35b-a3b",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "中型尺寸",
-    },
-    "Qwen3.5-27B": {
-        "model": "qwen3.5-27b",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "262K",
-        "note": "中型尺寸",
-    },
-    "Qwen3.5-9B": {
-        "model": "qwen3.5-9b",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "小尺寸",
-    },
-    "Qwen3.5-4B": {
-        "model": "qwen3.5-4b",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "小尺寸",
-    },
-    "Qwen3.5-2B": {
-        "model": "qwen3.5-2b",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "小尺寸",
-    },
-    "Qwen3.5-0.8B": {
-        "model": "qwen3.5-0.8b",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "小尺寸",
-    },
-    "Qwen-Flash": {
-        "model": "qwen-flash",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "1M",
-        "note": "极速响应，轻量任务",
-    },
-    "Qwen3.6-Flash": {
-        "model": "qwen3.6-flash",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "1M",
-        "note": "推荐轻量模型",
-    },
-    "Qwen-Turbo": {
-        "model": "qwen-turbo",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "轻量极速版本",
-    },
-    "Qwen-Long": {
-        "model": "qwen-long",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "10M",
-        "note": "超长文本",
-    },
-    "Qwen3-Coder-Next": {
-        "model": "qwen3-coder-next",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "256K",
-        "note": "代码专精，仓库级理解",
-    },
-    "Qwen-Coder": {
-        "model": "qwen-coder",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "代码专项模型",
-    },
-    "Qwen-VL": {
-        "model": "qwen-vl",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "视觉语言模型",
-    },
-    "Qwen3-VL-235B": {
-        "model": "qwen3-vl-235b",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "顶级视觉+语言",
-    },
-    "Qwen2.5-VL-72B-Instruct": {
-        "model": "qwen2.5-vl-72b-instruct",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "视觉语言模型",
-    },
-    "Qwen-Omni": {
-        "model": "qwen-omni",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "全模态模型",
-    },
-    "Qwen2.5-Omni": {
-        "model": "qwen2.5-omni",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "音视频多模态",
-    },
-    "Qwen-Math": {
-        "model": "qwen-math",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "数学推理模型",
-    },
-    "Qwen-Image-3.0": {
-        "model": "qwen-image-3.0",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "图像生成模型",
-    },
-    "Qwen-Image-3.0-Pro": {
-        "model": "qwen-image-3.0-pro",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "provider": "Qwen",
-        "context": "128K",
-        "note": "图像生成专业版",
-    },
-    # ==================== LongCat (美团) ====================
-    "LongCat-2.0": {
-        "model": "LongCat-2.0",
-        "base_url": "https://api.longcat.chat/openai/v1",
-        "provider": "LongCat",
-        "context": "1M",
-        "note": "1.6T MoE，Agentic Coding 旗舰",
-    },
-    # ==================== 自定义 ====================
-    "自定义": {
-        "model": "",
-        "base_url": "",
-        "provider": "Custom",
-        "context": "",
-        "note": "手动配置 OpenAI 兼容端点",
-    },
-}
+# 默认窗口大小占屏幕的比例
+DEFAULT_WINDOW_WIDTH_RATIO: float = 0.7
+DEFAULT_WINDOW_HEIGHT_RATIO: float = 0.8
+# 默认窗口最大尺寸限制
+MAX_WINDOW_WIDTH: int = 1200
+MAX_WINDOW_HEIGHT: int = 900
+# 窗口最小尺寸限制
+MIN_WINDOW_WIDTH: int = 450
+MIN_WINDOW_HEIGHT: int = 400
+
+
+# ============================================================
+# 定时器间隔常量（毫秒）
+# ============================================================
+MODEL_VERIFY_DELAY_MS: int = 500  # 启动时模型验证延迟
+WATCHDOG_CHECK_INTERVAL_MS: int = 2000  # 看门狗检查间隔
+ELAPSED_TIMER_INTERVAL_MS: int = 1000  # 已用时间更新间隔
+
+
+# ============================================================
+# 超时时间常量（秒）
+# ============================================================
+WATCHDOG_TIMEOUT_S: float = 300.0  # 看门狗超时时间（5分钟）
+WORKER_WAIT_TIMEOUT_MS: int = 5000  # Worker 等待超时
+THREAD_WAIT_TIMEOUT_MS: int = 1000  # 线程等待超时
+CLOSE_WAIT_TIMEOUT_MS: int = 3000  # 关闭窗口时等待超时
+
+
+# ============================================================
+# 进度与日志常量
+# ============================================================
+MAX_LOG_BLOCK_COUNT: int = 5000  # 日志最大行数
+PROGRESS_BAR_MAX: int = 100  # 进度条最大值
+
+
+# ============================================================
+# 翻译配置常量
+# ============================================================
+DEFAULT_CHAR_COUNT: int = 5000  # 默认字符数（用于成本估算）
+COMPARISON_CHAR_COUNT: int = 10000  # 成本对比字符数
+MAX_FILE_PREFIX_LENGTH: int = 50  # 输出文件夹名中文件名最大长度
+
+
+# ============================================================
+# 预设模型配置（动态加载）
+# ============================================================
+_models_dict: Dict[str, Dict[str, Any]] = {}
+
+
+def _get_preset_models_dict() -> Dict[str, Dict[str, Any]]:
+    """获取预设模型配置字典（动态加载自配置文件）
+
+    Returns:
+        预设模型配置字典
+    """
+    global _models_dict
+    if not _models_dict:
+        try:
+            _models_dict = get_preset_models()
+        except Exception:
+            _models_dict = {}
+    return _models_dict
+
+
+def _reload_preset_models() -> Dict[str, Dict[str, Any]]:
+    """重新加载预设模型配置
+
+    Returns:
+        重新加载后的预设模型配置字典
+    """
+    global _models_dict
+    _models_dict = {}
+    return _get_preset_models_dict()
+
 
 # 供应商列表（用于筛选）
-PROVIDERS = ["全部", "DeepSeek", "GLM", "GLM-Vision", "Kimi", "OpenAI", "Qwen", "LongCat", "自定义"]
-
-# 默认 API Key 存储（按供应商）
-PROVIDER_API_KEYS = {}
+PROVIDERS = ["全部", "DeepSeek", "GLM", "GLM-Vision", "OpenAI", "Qwen", "LongCat", "自定义"]
 
 # 翻译阶段名称映射（用于进度显示）
 TRANSLATION_STAGES = {
@@ -603,449 +155,20 @@ LANGUAGES = {
 }
 
 
-class TranslationWorker(QThread):
-    """翻译工作线程 - 增强版，支持术语替换、心跳、容错"""
-    # 信号定义
-    progress_updated = pyqtSignal(str, int)  # 进度文本, 进度百分比
-    stage_changed = pyqtSignal(str, str)     # 阶段名称(中文), 阶段描述
-    log_message = pyqtSignal(str)
-    token_updated = pyqtSignal(int, int, int)  # prompt_tokens, completion_tokens, total_tokens
-    time_updated = pyqtSignal(float, float)    # 已用时间(秒), 预估剩余时间(秒)
-    term_replaced = pyqtSignal(int)            # 术语替换数量
-    heartbeat = pyqtSignal()                   # 心跳信号（防假死）
-    retry_happened = pyqtSignal(int, float, str)  # 重试信号（次数, 延迟, 错误）
-    finished_success = pyqtSignal(str, dict)   # 输出文件路径, 统计信息
-    finished_error = pyqtSignal(str)
-
-    def __init__(self, config: dict):
-        super().__init__()
-        self.config = config
-        self._is_cancelled = False
-        self._start_time = 0
-        self._stage_start_time = 0
-        self._current_stage = ""
-        # 术语替换相关
-        self._enable_term_replacement = config.get("enable_term_replacement", False)
-        self._glossary_terms = config.get("glossary_terms", [])
-        self._term_replacer = create_default_replacer()
-        self._term_injector = TermInjector()
-        self._smart_matcher = SmartTermMatcher()
-        # 容错机制
-        self._heartbeat = WorkerHeartbeat(interval=3.0)
-        self._heartbeat.connect(self.heartbeat)
-        self._api_guardian = APIGuardian()
-        # 高级功能
-        self._enable_multi_engine = config.get("enable_multi_engine", False)
-        self._multi_strategy = config.get("multi_engine_strategy", "balanced")
-        self._multi_model2 = config.get("multi_engine_model2", "glm-4-air")
-        self._enable_adaptive_mt = config.get("enable_adaptive_mt", True)
-        self._enable_ocr = config.get("enable_ocr", True)
-        # 自适应 MT
-        self._amt = AdaptiveMT() if self._enable_adaptive_mt else None
-        # 成本分析
-        self._cost_analyzer = CostAnalyzer()
-        # 翻译统计
-        self._model_name = config.get("model", "unknown")
-
-    def cancel(self):
-        self._is_cancelled = True
-
-    def _translate_stage(self, stage_name: str) -> str:
-        """将英文阶段名称翻译为中文"""
-        return TRANSLATION_STAGES.get(stage_name, stage_name)
-
-    def _format_time(self, seconds: float) -> str:
-        """格式化时间显示"""
-        if seconds < 60:
-            return f"{int(seconds)}秒"
-        elif seconds < 3600:
-            minutes = int(seconds // 60)
-            secs = int(seconds % 60)
-            return f"{minutes}分{secs}秒"
-        else:
-            hours = int(seconds // 3600)
-            minutes = int((seconds % 3600) // 60)
-            return f"{hours}时{minutes}分"
-
-    def _check_resume_translation(self):
-        """探针 5 阶段加固：断点续翻检查。
-
-        扫描 output 目录，若已有同名翻译结果 PDF，说明上次翻译中断。
-        BabelDOC 自带句对级 cache（cache.py），重启后相同句对会从缓存读取，
-        此处仅做日志提示与页面级跳过预检。
-        """
-        try:
-            from pathlib import Path
-
-            output_dir = self.config.get("output_dir")
-            if not output_dir:
-                return
-
-            output_path = Path(output_dir)
-            if not output_path.exists():
-                return
-
-            input_file = Path(self.config["input_file"])
-            input_stem = input_file.stem
-            lang_out = self.config.get("lang_out", "zh")
-
-            # BabelDOC 输出命名模式：{stem}.{lang_out}.pdf / {stem}.dual.pdf
-            expected_patterns = [
-                f"{input_stem}.{lang_out}.pdf",
-                f"{input_stem}.dual.pdf",
-                f"{input_stem}.mono.pdf",
-            ]
-
-            existing_results = []
-            for pattern in expected_patterns:
-                candidate = output_path / pattern
-                if candidate.exists():
-                    existing_results.append(candidate)
-
-            if existing_results:
-                self.log_message.emit(
-                    f"📦 检测到已有翻译结果 {len(existing_results)} 个文件，"
-                    "将利用缓存断点续翻（句对级缓存自动生效）"
-                )
-                for r in existing_results:
-                    self.log_message.emit(f"  已存在: {r.name} ({r.stat().st_size // 1024} KB)")
-            else:
-                self.log_message.emit("首次翻译，无历史缓存")
-
-        except Exception as e:
-            # 断点续翻检查失败不应阻断翻译流程
-            self.log_message.emit(f"断点续翻检查跳过: {e}")
-
-    def run(self):
-        import time
-        import traceback
-        import threading
-        self._start_time = time.monotonic()
-
-        # 独立心跳线程：确保长 API 调用期间看门狗不会误判超时
-        self._heartbeat_active = True
-        def _heartbeat_thread():
-            while self._heartbeat_active:
-                time.sleep(30)
-                if self._heartbeat_active:
-                    self.heartbeat.emit()
-        heartbeat_thread = threading.Thread(target=_heartbeat_thread, daemon=True)
-        heartbeat_thread.start()
-
-        try:
-            self.log_message.emit("=" * 50)
-            self.log_message.emit("正在初始化翻译器...")
-            self.progress_updated.emit("初始化翻译器...", 1)
-            self.stage_changed.emit("init", "初始化...")
-
-            # 验证输入文件存在
-            if not self.config.get("input_file"):
-                self.finished_error.emit("未选择输入文件")
-                return
-            if not Path(self.config["input_file"]).exists():
-                self.finished_error.emit(f"输入文件不存在: {self.config['input_file']}")
-                return
-
-            # 验证 API Key
-            if not self.config.get("api_key"):
-                self.finished_error.emit("API Key 为空")
-                return
-
-            # 创建翻译器
-            translator = OpenAITranslator(
-                lang_in=self.config["lang_in"],
-                lang_out=self.config["lang_out"],
-                model=self.config["model"],
-                base_url=self.config["base_url"],
-                api_key=self.config["api_key"],
-            )
-
-            # 配置术语替换
-            glossary_terms = self.config.get("glossary_terms", [])
-            if self._enable_term_replacement and glossary_terms:
-                # 保存原始 prompt 方法
-                original_prompt = translator.prompt
-
-                # 构建术语提示
-                term_hint = self._term_injector.build_term_hint(glossary_terms, max_terms=15)
-
-                # 包装 prompt 方法，添加术语指导
-                def enhanced_prompt(text, _original=original_prompt, _hint=term_hint):
-                    messages = _original(text)
-                    # 在 system prompt 中添加术语指导
-                    if _hint and messages:
-                        messages[0]["content"] += _hint
-                    return messages
-
-                translator.prompt = enhanced_prompt
-
-                # 保存原始 translate 方法
-                original_translate = translator.translate
-
-                # 包装 translate 方法，后处理术语
-                def enhanced_translate(text, _original=original_translate,
-                                       _terms=glossary_terms,
-                                       _replacer=self._term_replacer):
-                    # 翻译前：替换术语为占位符
-                    pre_processed = _replacer.pre_translate(text, _terms)
-
-                    # 执行翻译
-                    translated = _replacer.post_translate(_original(pre_processed))
-
-                    return translated
-
-                # 注意：这里不覆盖 translate，因为 BabelDOC 内部调用的是 do_translate
-                # 我们在 do_translate 层面处理
-                original_do_translate = translator.do_translate
-
-                def enhanced_do_translate(text, rate_limit_params=None,
-                                          _original=original_do_translate,
-                                          _terms=glossary_terms,
-                                          _replacer=self._term_replacer,
-                                          _self=self):
-                    # 翻译前：替换术语为占位符
-                    pre_processed = _replacer.pre_translate(text, _terms)
-
-                    # 执行翻译
-                    translated = _original(pre_processed, rate_limit_params)
-
-                    # 翻译后：还原占位符为术语翻译
-                    result = _replacer.post_translate(translated)
-
-                    # 发送替换数量信号
-                    count = _replacer.get_replacement_count()
-                    if count > 0:
-                        _self.term_replaced.emit(count)
-
-                    return result
-
-                translator.do_translate = enhanced_do_translate
-
-                self.log_message.emit(f"术语替换已启用: {len(glossary_terms)} 条术语")
-            else:
-                if not glossary_terms:
-                    self.log_message.emit("术语库为空，跳过术语替换")
-                else:
-                    self.log_message.emit("术语替换已禁用")
-
-            # 配置自适应 MT
-            if self._enable_adaptive_mt and self._amt:
-                adaptive_addon = self._amt.get_adaptive_prompt_addon(
-                    self.config["lang_in"], self.config["lang_out"],
-                    self.config["model"]
-                )
-                if adaptive_addon:
-                    # 保存原始 prompt 方法
-                    orig_prompt = translator.prompt
-
-                    def enhanced_prompt_with_amt(text, _orig=orig_prompt, _addon=adaptive_addon):
-                        messages = _orig(text)
-                        if messages:
-                            messages[0]["content"] += _addon
-                        return messages
-
-                    translator.prompt = enhanced_prompt_with_amt
-                    amt_stats = self._amt.get_stats()
-                    self.log_message.emit(f"自适应学习已启用: {amt_stats['total_rules']} 条规则")
-
-            self.log_message.emit(f"翻译器就绪: {self.config['model']}")
-            self.log_message.emit(f"语言: {self.config['lang_in']} → {self.config['lang_out']}")
-            self.progress_updated.emit("初始化完成...", 3)
-            self.stage_changed.emit("init", "初始化完成")
-            self._heartbeat.beat()
-
-            # 导入 BabelDOC 核心模块
-            self.log_message.emit("导入 BabelDOC 核心模块...")
-            from babeldoc.format.pdf.high_level import async_translate
-            from babeldoc.format.pdf.translation_config import TranslationConfig
-            from babeldoc.docvision.doclayout import DocLayoutModel
-
-            self.log_message.emit("加载文档布局模型...")
-            self.progress_updated.emit("加载布局模型...", 5)
-            self.stage_changed.emit("loading_model", "加载布局模型...")
-            self._heartbeat.beat()
-
-            # 加载布局模型（可能耗时较长）
-            try:
-                doc_layout_model = DocLayoutModel.load_onnx()
-                self.log_message.emit("布局模型加载完成")
-                self._heartbeat.beat()
-            except Exception as e:
-                self.log_message.emit(f"布局模型加载失败: {e}")
-                self.finished_error.emit(f"无法加载文档布局模型: {e}")
-                return
-
-            self.log_message.emit(f"开始翻译: {Path(self.config['input_file']).name}")
-            self.progress_updated.emit("开始翻译...", 8)
-            self.stage_changed.emit("translating", "翻译中...")
-            self._heartbeat.beat()
-
-            # 探针 5 阶段加固：断点续翻检查
-            # 扫描 output 目录，若已有翻译结果则利用 BabelDOC 句对缓存续翻
-            self._check_resume_translation()
-
-            # 创建翻译配置
-            translation_config = TranslationConfig(
-                translator=translator,
-                input_file=self.config["input_file"],
-                lang_in=self.config["lang_in"],
-                lang_out=self.config["lang_out"],
-                doc_layout_model=doc_layout_model,
-                pages=self.config.get("pages"),
-                output_dir=self.config.get("output_dir"),
-                no_dual=self.config.get("no_dual", False),
-                no_mono=self.config.get("no_mono", False),
-                qps=self.config.get("qps", 4),
-                # OCR 配置
-                ocr_workaround=self.config.get("enable_ocr", False),
-                auto_enable_ocr_workaround=self.config.get("enable_ocr", False),
-            )
-
-            # 异步翻译并追踪进度
-            import asyncio
-
-            async def run_translation():
-                result = None
-                last_progress = 8
-                stage_progress_map = {}  # 记录每个阶段的进度
-
-                async for event in async_translate(translation_config):
-                    if self._is_cancelled:
-                        return None
-
-                    # 发送心跳（防假死）- 直接发射信号
-                    self.heartbeat.emit()
-
-                    event_type = event.get("type", "")
-                    now = time.monotonic()
-                    elapsed = now - self._start_time
-
-                    if event_type == "progress_start":
-                        stage_name = event.get("stage", "")
-                        self._current_stage = stage_name
-                        self._stage_start_time = now
-                        stage_cn = self._translate_stage(stage_name)
-                        desc = f"开始: {stage_cn}"
-                        self.stage_changed.emit(stage_name, desc)
-                        self.log_message.emit(f"▶ {stage_cn}")
-
-                    elif event_type == "progress_update":
-                        stage_progress = event.get("stage_progress", 0)  # 0-100 百分比
-                        stage_name = event.get("stage", "")
-                        stage_cn = self._translate_stage(stage_name)
-
-                        # 计算整体进度 (8% - 95%)
-                        overall = int(8 + stage_progress * 0.87)
-                        overall = min(overall, 95)
-                        overall = max(overall, last_progress)
-                        last_progress = overall
-
-                        # 计算预估时间
-                        if stage_progress > 0:
-                            stage_elapsed = now - self._stage_start_time
-                            stage_remaining = stage_elapsed * (100 - stage_progress) / stage_progress
-                            # 简单估算：假设剩余阶段按当前速度
-                            total_estimate = elapsed + stage_remaining * 3
-                            remaining = max(0, total_estimate - elapsed)
-                            self.time_updated.emit(elapsed, remaining)
-
-                        self.progress_updated.emit(stage_cn, overall)
-
-                    elif event_type == "progress_end":
-                        stage_name = event.get("stage", "")
-                        stage_cn = self._translate_stage(stage_name)
-                        stage_elapsed = now - self._stage_start_time
-                        self.stage_changed.emit(stage_name, f"完成: {stage_cn}")
-                        self.log_message.emit(f"✓ {stage_cn} ({self._format_time(stage_elapsed)})")
-
-                        # 发送 Token 统计
-                        if hasattr(translator, 'token_count'):
-                            self.token_updated.emit(
-                                translator.prompt_token_count.value,
-                                translator.completion_token_count.value,
-                                translator.token_count.value,
-                            )
-
-                    elif event_type == "finish":
-                        result = event.get("result")
-
-                    elif event_type == "error":
-                        error_obj = event.get("error", "未知错误")
-                        error_msg = str(error_obj) if not isinstance(error_obj, str) else error_obj
-                        self.finished_error.emit(error_msg)
-                        return None
-
-                return result
-
-            # 运行异步翻译
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                result = loop.run_until_complete(run_translation())
-                loop.close()
-            except Exception as e:
-                self.log_message.emit(f"翻译过程异常: {e}")
-                self.finished_error.emit(f"翻译失败: {e}")
-                return
-
-            if self._is_cancelled:
-                self.log_message.emit("翻译已取消")
-                return
-
-            if result:
-                self.progress_updated.emit("翻译完成!", 100)
-                self.stage_changed.emit("finish", "翻译完成!")
-
-                # 收集统计信息
-                stats = {
-                    "total_time": time.monotonic() - self._start_time,
-                    "prompt_tokens": translator.prompt_token_count.value,
-                    "completion_tokens": translator.completion_token_count.value,
-                    "total_tokens": translator.token_count.value,
-                    "model": self.config.get("model", "unknown"),
-                }
-
-                # 获取输出文件路径
-                output_path = None
-                if hasattr(result, 'dual_pdf_path') and result.dual_pdf_path:
-                    output_path = str(result.dual_pdf_path)
-                elif hasattr(result, 'mono_pdf_path') and result.mono_pdf_path:
-                    output_path = str(result.mono_pdf_path)
-
-                # 输出最终统计
-                self.log_message.emit("=" * 50)
-                self.log_message.emit(f"翻译完成! 总耗时: {self._format_time(stats['total_time'])}")
-                self.log_message.emit(f"Token 使用: prompt={stats['prompt_tokens']}, completion={stats['completion_tokens']}, total={stats['total_tokens']}")
-
-                if hasattr(result, 'total_valid_character_count') and result.total_valid_character_count:
-                    self.log_message.emit(f"翻译字符数: {result.total_valid_character_count}")
-
-                self.finished_success.emit(output_path or "翻译完成", stats)
-            else:
-                self.finished_error.emit("翻译结果为空")
-
-        except Exception as e:
-            # 捕获完整异常信息，避免闪退
-            import traceback
-            error_detail = traceback.format_exc()
-            error_msg = f"{type(e).__name__}: {str(e)}"
-            # 发送详细错误日志
-            self.log_message.emit(f"❌ 翻译异常:\n{error_detail}")
-            self.finished_error.emit(error_msg)
-
 
 class ApiVerifyWorker(QThread):
     """API 验证工作线程（异步，不阻塞 UI）"""
     finished_ok = pyqtSignal(str)
     finished_err = pyqtSignal(str)
 
-    def __init__(self, api_key, base_url, model):
+    def __init__(self, api_key: str, base_url: str, model: str) -> None:
         super().__init__()
-        self.api_key = api_key
-        self.base_url = base_url
-        self.model = model
+        self.api_key: str = api_key
+        self.base_url: str = base_url
+        self.model: str = model
 
-    def run(self):
+    def run(self) -> None:
+        """执行 API 验证"""
         try:
             translator = OpenAITranslator(
                 lang_in="en",
@@ -1060,36 +183,204 @@ class ApiVerifyWorker(QThread):
             self.finished_err.emit(f"{type(e).__name__}: {str(e)}")
 
 
+@dataclass
+class ModelVerifyResult:
+    """模型验证结果数据类"""
+    model_name: str
+    is_available: bool
+    error_message: str = ""
+    verify_time: float = 0.0
+
+
+class ModelAvailabilityChecker(QObject):
+    """模型可用性检查器 - 批量验证模型是否可用"""
+    finished = pyqtSignal(dict)
+
+    def __init__(self, api_key: str, timeout: float = 5.0) -> None:
+        super().__init__()
+        self.api_key: str = api_key
+        self.timeout: float = timeout
+
+    def verify_model(self, model_name: str, base_url: str) -> ModelVerifyResult:
+        """验证单个模型的可用性。
+
+        Args:
+            model_name: 模型名称
+            base_url: API Base URL
+
+        Returns:
+            模型验证结果
+        """
+        import time
+        start_time = time.time()
+        try:
+            translator = OpenAITranslator(
+                lang_in="en",
+                lang_out="zh",
+                model=model_name,
+                base_url=base_url,
+                api_key=self.api_key,
+            )
+            # 使用简单的测试消息验证
+            result = translator.translate("Hi")
+            elapsed = time.time() - start_time
+            if result and len(result) > 0:
+                return ModelVerifyResult(
+                    model_name=model_name,
+                    is_available=True,
+                    verify_time=elapsed,
+                )
+            else:
+                return ModelVerifyResult(
+                    model_name=model_name,
+                    is_available=False,
+                    error_message="Empty response",
+                    verify_time=elapsed,
+                )
+        except Exception as e:
+            elapsed = time.time() - start_time
+            return ModelVerifyResult(
+                model_name=model_name,
+                is_available=False,
+                error_message=f"{type(e).__name__}: {str(e)}",
+                verify_time=elapsed,
+            )
+
+    def verify_all(self, models: List[Dict[str, Any]]) -> Dict[str, bool]:
+        """批量验证多个模型，返回 {model_name: is_available} 字典。
+
+        Args:
+            models: 模型信息列表，每个元素包含 name, base_url, model 键
+
+        Returns:
+            模型名称到可用性的映射字典
+        """
+        results: Dict[str, bool] = {}
+        for model_info in models:
+            name = model_info["name"]
+            base_url = model_info["base_url"]
+            model_id = model_info["model"]
+            result = self.verify_model(model_id, base_url)
+            results[name] = result.is_available
+        # 发射完成信号
+        self.finished.emit(results)
+        return results
+
+
 class MainWindow(QMainWindow):
     """BabelDOC PDF 翻译工具主窗口"""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("BabelDOC PDF 翻译工具")
-        
+
         # 响应式窗口大小：默认为屏幕的 70%
         from PyQt6.QtGui import QGuiApplication
         screen = QGuiApplication.primaryScreen().availableGeometry()
-        default_w = min(int(screen.width() * 0.7), 1200)
-        default_h = min(int(screen.height() * 0.8), 900)
-        self.setMinimumSize(600, 500)
+        default_w = min(int(screen.width() * DEFAULT_WINDOW_WIDTH_RATIO), MAX_WINDOW_WIDTH)
+        default_h = min(int(screen.height() * DEFAULT_WINDOW_HEIGHT_RATIO), MAX_WINDOW_HEIGHT)
+        self.setMinimumSize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
         self.resize(default_w, default_h)
 
-        self.input_file = None
-        self.output_dir = None
-        self.worker = None
-        self.settings_file = PROJECT_ROOT / "gui_settings.json"
-        self._pdf_page_count = 0
-
-
-        # 加载已保存的供应商 API Key
-        self._load_provider_keys()
+        self.input_file: Optional[str] = None
+        self.output_dir: Optional[str] = None
+        self.worker: Optional[TranslationWorker] = None
+        self.settings_file: Path = PROJECT_ROOT / "gui_settings.json"
+        self._pdf_page_count: int = 0
+        self.config_manager: ConfigManager = get_config()
+        self._model_verify_results: Dict[str, bool] = {}
+        self._watchdog: Optional[HeartbeatWatchdog] = None
+        self._start_time: float = 0.0
+        self._last_remaining: float = -1.0
+        self.output_path: Optional[str] = None
 
         self._setup_ui()
         self._load_settings()
         self._update_adaptive_stats()
+        self._schedule_model_verification()
 
-    def _update_adaptive_stats(self):
+    def _schedule_model_verification(self) -> None:
+        """调度启动时的模型可用性验证（延迟执行，不阻塞UI）"""
+        api_key = self.config_manager.config.last_session.api_key
+        if not api_key:
+            return
+        # 延迟启动验证，确保UI已完全加载
+        QTimer.singleShot(MODEL_VERIFY_DELAY_MS, self._verify_all_models)
+
+    def _verify_all_models(self) -> None:
+        """验证所有DeepSeek模型的可用性"""
+        try:
+            from gui.main_window import ModelAvailabilityChecker
+
+            api_key = self.config_manager.config.last_session.api_key
+            if not api_key:
+                return
+
+            # 收集所有DeepSeek模型
+            deepseek_models: List[Dict[str, str]] = [
+                {"name": name, "base_url": info["base_url"], "model": info["model"]}
+                for name, info in _get_preset_models_dict().items()
+                if info.get("provider") == "DeepSeek"
+            ]
+            if not deepseek_models:
+                return
+
+            # 在后台线程中验证
+            self._model_checker = ModelAvailabilityChecker(api_key)
+            self._model_verify_thread = QThread()
+            self._model_checker.moveToThread(self._model_verify_thread)
+            self._model_verify_thread.started.connect(
+                lambda: self._model_checker.verify_all(deepseek_models)
+            )
+            self._model_checker.finished.connect(self._on_model_verify_finished)
+            self._model_verify_thread.start()
+        except Exception as e:
+            logging.getLogger(__name__).warning("模型验证启动失败: %s", e)
+
+    def _on_model_verify_finished(self, results: Dict[str, bool]) -> None:
+        """模型验证完成后的回调。
+
+        Args:
+            results: 模型名称到可用性的映射
+        """
+        try:
+            self._model_verify_results = results
+            unavailable = [name for name, ok in results.items() if not ok]
+            if unavailable:
+                logging.getLogger(__name__).info(
+                    "以下DeepSeek模型不可用，已从列表移除: %s", unavailable
+                )
+                # 更新模型下拉列表
+                self._filter_unavailable_models(unavailable)
+            # 清理线程
+            if hasattr(self, '_model_verify_thread'):
+                self._model_verify_thread.quit()
+                self._model_verify_thread.wait(THREAD_WAIT_TIMEOUT_MS)
+        except Exception as e:
+            logging.getLogger(__name__).warning("模型验证结果处理失败: %s", e)
+
+    def _filter_unavailable_models(self, unavailable_models: List[str]) -> None:
+        """从下拉列表中移除不可用的模型。
+
+        Args:
+            unavailable_models: 不可用的模型名称列表
+        """
+        try:
+            model_combo = self.model_combo
+            # 获取当前选中的模型
+            current_model = model_combo.currentText()
+            # 移除不可用模型
+            for model_name in unavailable_models:
+                index = model_combo.findText(model_name)
+                if index >= 0:
+                    model_combo.removeItem(index)
+            # 如果当前选中的模型被移除，重置为第一个可用模型
+            if current_model in unavailable_models:
+                model_combo.setCurrentIndex(0)
+        except Exception as e:
+            logging.getLogger(__name__).warning("过滤不可用模型失败: %s", e)
+
+    def _update_adaptive_stats(self) -> None:
         """更新自适应学习统计标签"""
         try:
             amt = AdaptiveMT()
@@ -1159,7 +450,8 @@ class MainWindow(QMainWindow):
     def _create_model_group(self) -> QGroupBox:
         group = QGroupBox("模型配置")
         layout = QVBoxLayout(group)
-        layout.setSpacing(6)
+        layout.setSpacing(4)
+        layout.setContentsMargins(8, 6, 8, 6)
 
         # 第一行：供应商筛选 + 模型选择
         select_row = QHBoxLayout()
@@ -1175,7 +467,7 @@ class MainWindow(QMainWindow):
         select_row.addWidget(QLabel("选择模型:"))
 
         self.model_combo = QComboBox()
-        self.model_combo.addItems(list(PRESET_MODELS.keys()))
+        self.model_combo.addItems(list(_get_preset_models_dict().keys()))
 
         self.model_combo.setMaxVisibleItems(20)
         self.model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
@@ -1223,44 +515,37 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(api_row)
 
-        # 第三行：Base URL + 模型名称
+        # 第三行：Base URL + 上下文长度（小屏友好）
         param_row = QHBoxLayout()
-        param_row.setSpacing(6)
+        param_row.setSpacing(4)
         param_row.addWidget(QLabel("Base URL:"))
 
         self.base_url_edit = QLineEdit()
         self.base_url_edit.setPlaceholderText("https://api.example.com/v1")
-        param_row.addWidget(self.base_url_edit, 1)
+        self.base_url_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        param_row.addWidget(self.base_url_edit, 2)
 
-        param_row.addWidget(QLabel("自定义模型名:"))
-
-        self.model_name_edit = QLineEdit()
-        self.model_name_edit.setPlaceholderText("model-name")
-        self.model_name_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        param_row.addWidget(self.model_name_edit, 1)
-
-        # 上下文长度显示
-        param_row.addWidget(QLabel("上下文:"))
-        self.context_label = QLabel("--")
-        self.context_label.setStyleSheet("color: #555; font-size: 9pt; padding: 1px 4px; background-color: #f0f0f0; border-radius: 3px;")
-        self.context_label.setMinimumWidth(50)
+        # 上下文长度（预设模型只读，自定义模型可编辑）
+        self.context_label = QLabel("上下文:")
         param_row.addWidget(self.context_label)
+        self.context_edit = QLineEdit()
+        self.context_edit.setPlaceholderText("1M/128K/64K")
+        self.context_edit.setFixedWidth(70)
+        self.context_edit.setToolTip(
+            "预设模型自动填充，自定义模型请手动填写上下文长度\n"
+            "格式: 1M / 128K / 64K 等"
+        )
+        param_row.addWidget(self.context_edit, 0)
 
         layout.addLayout(param_row)
+
+        # 模型名存储（隐藏，用于保存自定义模型名）
+        self.model_name_edit = QLineEdit()
+        self.model_name_edit.setVisible(False)
 
         # 第四行：API Key 管理（按供应商保存）
         key_mgmt_row = QHBoxLayout()
         key_mgmt_row.setSpacing(6)
-        self.save_key_btn = QPushButton("💾 保存 Key")
-        self.save_key_btn.setToolTip("保存当前 API Key 到对应供应商")
-        self.save_key_btn.clicked.connect(self._save_api_key_for_provider)
-        key_mgmt_row.addWidget(self.save_key_btn)
-
-        self.clear_key_btn = QPushButton("🗑 清除")
-        self.clear_key_btn.setToolTip("清除当前输入的 API Key")
-        self.clear_key_btn.clicked.connect(self._clear_api_key)
-        key_mgmt_row.addWidget(self.clear_key_btn)
-
         key_mgmt_row.addStretch()
 
         # 显示已保存的 Key 状态
@@ -1311,6 +596,20 @@ class MainWindow(QMainWindow):
         self.mono_checkbox.setChecked(True)
         opt_row.addWidget(self.mono_checkbox)
 
+        self.skip_references_check = QCheckBox("跳过引用")
+        self.skip_references_check.setChecked(True)
+        self.skip_references_check.setToolTip(
+            "跳过 References/参考文献 列表翻译，保持原文。"
+        )
+        opt_row.addWidget(self.skip_references_check)
+
+        self.auto_open_output_check = QCheckBox("自动打开输出目录")
+        self.auto_open_output_check.setChecked(True)
+        self.auto_open_output_check.setToolTip(
+            "翻译完成后自动打开输出文件所在目录。"
+        )
+        opt_row.addWidget(self.auto_open_output_check)
+
         opt_row.addStretch()
         layout.addLayout(opt_row)
         return group
@@ -1324,7 +623,7 @@ class MainWindow(QMainWindow):
         # === 第一行：成本分析 ===
         cost_row = QHBoxLayout()
         cost_row.setSpacing(4)
-        cost_row.addWidget(QLabel("💰:"))
+        cost_row.addWidget(QLabel("费用:"))
 
         self.cost_estimate_label = QLabel("未估算")
         self.cost_estimate_label.setStyleSheet("""
@@ -1354,7 +653,7 @@ class MainWindow(QMainWindow):
         # === 第二行：多引擎对比 ===
         multi_row = QHBoxLayout()
         multi_row.setSpacing(4)
-        multi_row.addWidget(QLabel("🔄:"))
+        multi_row.addWidget(QLabel("多引擎:"))
 
         self.multi_engine_check = QCheckBox("多引擎")
         self.multi_engine_check.setToolTip("同时使用多个模型翻译，选择最佳结果")
@@ -1495,6 +794,16 @@ class MainWindow(QMainWindow):
                 background-color: #F5F5F5; border-radius: 3px;
             """)
 
+    def _toggle_smart_mode(self, checked: bool):
+        """智能并发开关变化（方案D）"""
+        self.qps_spin.setEnabled(not checked)
+        if checked:
+            self.qps_tip_label.setText("[智能] 智能模式已启用，自动优化并发数")
+            self.qps_tip_label.setStyleSheet("color: #1976D2; font-size: 10px; font-weight: bold;")
+        else:
+            self.qps_tip_label.setText("[提示] 免费模型建议 1-3，商用/本地模型可拉满 50")
+            self.qps_tip_label.setStyleSheet("color: #D32F2F; font-size: 10px; font-weight: bold;")
+
     def _create_file_group(self) -> QGroupBox:
         group = QGroupBox("文件处理")
         group.setAcceptDrops(True)
@@ -1536,51 +845,90 @@ class MainWindow(QMainWindow):
 
         btn_row.addSpacing(10)
 
-        # QPS 设置（带模型建议）
-        btn_row.addWidget(QLabel("QPS:"))
+        # QPS 设置（带模型建议）— 该值大幅影响处理速度，需醒目提示
+        qps_label = QLabel("QPS:")
+        qps_label.setStyleSheet("color: #D32F2F; font-weight: bold; font-size: 11px;")
+        btn_row.addWidget(qps_label)
+
+        # 智能并发复选框（方案D：默认启用智能模式）
+        self.smart_mode_check = QCheckBox("智能并发")
+        self.smart_mode_check.setChecked(True)
+        self.smart_mode_check.setToolTip("启用后自动根据模型性能和网络状况动态调整并发数\n禁用后可手动设置QPS值")
+        self.smart_mode_check.toggled.connect(self._toggle_smart_mode)
+        btn_row.addWidget(self.smart_mode_check)
+
         self.qps_spin = QSpinBox()
-        self.qps_spin.setRange(1, 20)
-        self.qps_spin.setValue(2)
+        self.qps_spin.setRange(1, 50)
+        self.qps_spin.setValue(10)  # 默认值改为10，更保守
+        self.qps_spin.setEnabled(False)  # 默认禁用（智能模式启用时）
+        self.qps_spin.setStyleSheet("""
+            QSpinBox {
+                border: 2px solid #D32F2F;
+                border-radius: 3px;
+                padding: 2px 4px;
+                font-weight: bold;
+                color: #D32F2F;
+            }
+            QSpinBox:disabled {
+                border-color: #999;
+                color: #999;
+            }
+        """)
         self.qps_spin.setToolTip(
-            "每秒请求数限制。不同模型建议值：\n"
-            "  DeepSeek: 4-10\n"
-            "  GLM-4:    3-5（免费版较慢）\n"
-            "  Kimi:     5-10\n"
-            "  GPT-4o:   2-4（注意 RPM 限制）\n"
-            "  免费模型: 1-2"
+            "每秒请求数限制。该值越大翻译越快，但可能触发 API 限流。\n"
+            "不同模型建议值：\n"
+            "  DeepSeek-V4: 20-50（高并发无限制）\n"
+            "  DeepSeek-Flash: 20-50\n"
+            "  GLM-5:      10-25（企业版）/ 3-10（免费版）\n"
+            "  Kimi-K3:    10-20\n"
+            "  GPT-5:      5-15（注意 RPM 限额）\n"
+            "  GPT-4o:     3-10（严格 RPM 限制）\n"
+            "  Qwen3-Max:  20-50（高并发）\n"
+            "  LongCat-2.0: 20-50\n"
+            "  免费/限速模型: 1-5（避免触发限流）\n"
+            "  本地部署模型: 50（无 API 限额）\n"
+            "  智能模式: 自动动态调整并发数"
         )
         btn_row.addWidget(self.qps_spin)
 
         # QPS 建议标签
-        self.qps_tip_label = QLabel("💡 根据模型额度调整")
-        self.qps_tip_label.setStyleSheet("color: #999; font-size: 10px;")
+        self.qps_tip_label = QLabel("[智能] 智能模式已启用，自动优化并发数")
+        self.qps_tip_label.setStyleSheet("color: #1976D2; font-size: 10px; font-weight: bold;")
         btn_row.addWidget(self.qps_tip_label)
 
         btn_row.addSpacing(15)
 
-        # 文档领域选择
-        btn_row.addWidget(QLabel("领域:"))
-        self.domain_combo = QComboBox()
-        self.domain_combo.addItem("自动识别", "")
-        from gui.core.ai_glossary import get_domains as _get_domains
-        for d in _get_domains():
-            self.domain_combo.addItem(d, d)
-        self.domain_combo.setToolTip("选择文档专业领域以加载对应术语库，或让系统自动识别")
-        btn_row.addWidget(self.domain_combo)
-
-        btn_row.addSpacing(10)
-
-        # 术语替换
-        self.term_replace_check = QCheckBox("术语替换")
-        self.term_replace_check.setToolTip("启用后自动使用术语库替换专业术语")
-        self.term_replace_check.setChecked(True)
-        btn_row.addWidget(self.term_replace_check)
-
-        # 导入术语库按钮
-        self.import_glossary_btn = QPushButton("导入AI术语")
-        self.import_glossary_btn.setToolTip("导入预置的 AI/计算机科学术语库")
-        self.import_glossary_btn.clicked.connect(self._import_ai_glossary)
-        btn_row.addWidget(self.import_glossary_btn)
+        # 术语替换与领域选择（合并为一个下拉框，默认关闭）
+        btn_row.addWidget(QLabel("术语:"))
+        self.term_domain_combo = QComboBox()
+        self.term_domain_combo.addItem("关闭（跳过术语替换）", "off")
+        self.term_domain_combo.addItem("自动识别领域", "auto")
+        self.term_domain_combo.insertSeparator(100)
+        from gui.core.ai_glossary import get_sub_domains as _get_sub_domains
+        for sd in _get_sub_domains("AI"):
+            self.term_domain_combo.addItem(f"  {sd}", sd)
+        self.term_domain_combo.insertSeparator(100)
+        for sd in _get_sub_domains("医学"):
+            self.term_domain_combo.addItem(f"  {sd}", sd)
+        self.term_domain_combo.insertSeparator(100)
+        for sd in _get_sub_domains("金融"):
+            self.term_domain_combo.addItem(f"  {sd}", sd)
+        self.term_domain_combo.insertSeparator(100)
+        for sd in _get_sub_domains("法律"):
+            self.term_domain_combo.addItem(f"  {sd}", sd)
+        self.term_domain_combo.insertSeparator(100)
+        for sd in _get_sub_domains("工程"):
+            self.term_domain_combo.addItem(f"  {sd}", sd)
+        self.term_domain_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self.term_domain_combo.setToolTip(
+            "启用术语替换会增加约 1 倍处理时间，建议在专业文献翻译时开启。\n"
+            "关闭 = 不进行术语预处理替换\n"
+            "自动识别 = 系统扫描前几页判断领域\n"
+            "选择具体领域 = 加载对应术语库进行预处理替换"
+        )
+        btn_row.addWidget(self.term_domain_combo, 1)
 
         layout.addLayout(btn_row)
         return group
@@ -1673,7 +1021,8 @@ class MainWindow(QMainWindow):
         # === 日志区域 ===
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMinimumHeight(100)
+        self.log_text.setMinimumHeight(80)
+        self.log_text.document().setMaximumBlockCount(MAX_LOG_BLOCK_COUNT)
         self.log_text.setFont(QFont("Consolas", 9))
         self.log_text.setStyleSheet("""
             QTextEdit {
@@ -1693,8 +1042,8 @@ class MainWindow(QMainWindow):
         layout.setSpacing(6)
 
         self.start_btn = QPushButton("▶ 开始翻译")
-        self.start_btn.setMinimumWidth(100)
         self.start_btn.setMinimumHeight(28)
+        self.start_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.start_btn.setStyleSheet("""
             QPushButton {
                 background-color: #4CAF50; color: white;
@@ -1704,37 +1053,31 @@ class MainWindow(QMainWindow):
             QPushButton:disabled { background-color: #ccc; color: #999; }
         """)
         self.start_btn.clicked.connect(self._start_translation)
-        layout.addWidget(self.start_btn)
+        layout.addWidget(self.start_btn, 2)
 
         self.cancel_btn = QPushButton("取消")
-        self.cancel_btn.setMinimumWidth(60)
         self.cancel_btn.setMinimumHeight(28)
+        self.cancel_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self._cancel_translation)
-        layout.addWidget(self.cancel_btn)
+        layout.addWidget(self.cancel_btn, 1)
 
-        self.open_output_btn = QPushButton("📁 输出目录")
-        self.open_output_btn.setMinimumWidth(80)
+        self.open_output_btn = QPushButton("📁 输出")
         self.open_output_btn.setMinimumHeight(28)
+        self.open_output_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.open_output_btn.clicked.connect(self._open_output_dir)
-        layout.addWidget(self.open_output_btn)
+        layout.addWidget(self.open_output_btn, 1)
 
-        layout.addStretch()
-
-        # 质量管理按钮
-        self.quality_btn = QPushButton("🔍 质量")
-        self.quality_btn.setMinimumWidth(60)
+        self.quality_btn = QPushButton("质量检查")
         self.quality_btn.setMinimumHeight(28)
         self.quality_btn.setToolTip("翻译记忆库、术语库、QA 检查")
         self.quality_btn.clicked.connect(self._open_quality_dialog)
-        layout.addWidget(self.quality_btn)
+        layout.addWidget(self.quality_btn, 1)
 
-        # 保存配置按钮
-        self.save_btn = QPushButton("💾 保存")
-        self.save_btn.setMinimumWidth(60)
+        self.save_btn = QPushButton("保存配置")
         self.save_btn.setMinimumHeight(28)
         self.save_btn.clicked.connect(self._save_settings)
-        layout.addWidget(self.save_btn)
+        layout.addWidget(self.save_btn, 1)
 
         return widget
 
@@ -1877,9 +1220,9 @@ class MainWindow(QMainWindow):
         filter_provider = "Custom" if provider == "自定义" else provider
 
         if provider == "全部":
-            self.model_combo.addItems(list(PRESET_MODELS.keys()))
+            self.model_combo.addItems(list(_get_preset_models_dict().keys()))
         else:
-            for name, config in PRESET_MODELS.items():
+            for name, config in _get_preset_models_dict().items():
                 if config.get("provider") == filter_provider:
                     self.model_combo.addItem(name)
 
@@ -1892,14 +1235,17 @@ class MainWindow(QMainWindow):
         if not text:
             return
 
-        config = PRESET_MODELS.get(text, {})
+        config = _get_preset_models_dict().get(text, {})
         self.base_url_edit.setText(config.get("base_url", ""))
         self.model_name_edit.setText(config.get("model", ""))
 
-        # 更新上下文长度显示
+        # 更新上下文长度（预设模型自动填充，自定义模型可编辑）
         context = config.get("context", "")
-        if hasattr(self, 'context_label'):
-            self.context_label.setText(context or "--")
+        if hasattr(self, 'context_edit'):
+            self.context_edit.setText(context or "")
+            # 自定义模型时可编辑，预设模型时只读
+            is_custom = (text == "自定义" or config.get("provider") == "Custom")
+            self.context_edit.setReadOnly(not is_custom)
 
         # 自定义模型时启用编辑
         is_custom = (text == "自定义" or config.get("provider") == "Custom")
@@ -1909,14 +1255,6 @@ class MainWindow(QMainWindow):
         # 更新删除按钮状态
         self.del_model_btn.setEnabled(is_custom)
 
-        # 尝试加载该供应商已保存的 API Key
-        provider = config.get("provider", "")
-        if provider in PROVIDER_API_KEYS and PROVIDER_API_KEYS[provider]:
-            self.api_key_edit.setText(PROVIDER_API_KEYS[provider])
-            self.key_status_label.setText(f"✓ 已加载 {provider} 的 Key")
-        else:
-            self.key_status_label.setText("")
-
     def _toggle_api_key_visibility(self, checked: bool):
         """切换 API Key 显示/隐藏"""
         if checked:
@@ -1925,32 +1263,6 @@ class MainWindow(QMainWindow):
         else:
             self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
             self.show_key_btn.setText("👁")
-
-    def _save_api_key_for_provider(self):
-        """保存当前 API Key 到对应供应商"""
-        api_key = self.api_key_edit.text().strip()
-        if not api_key:
-            QMessageBox.warning(self, "提示", "API Key 为空，无法保存")
-            return
-
-        model_name = self.model_combo.currentText()
-        config = PRESET_MODELS.get(model_name, {})
-        provider = config.get("provider", "")
-
-        if not provider or provider == "Custom":
-            # 自定义模型时按模型名称存储
-            provider = f"Custom:{model_name}"
-
-        PROVIDER_API_KEYS[provider] = api_key
-        self._save_provider_keys()
-
-        self.key_status_label.setText(f"✓ 已保存 {provider} 的 Key")
-        QMessageBox.information(self, "保存成功", f"API Key 已保存到: {provider}")
-
-    def _clear_api_key(self):
-        """清除当前输入的 API Key"""
-        self.api_key_edit.clear()
-        self.key_status_label.setText("")
 
     def _add_custom_model(self):
         """添加当前配置为自定义模型"""
@@ -1972,7 +1284,7 @@ class MainWindow(QMainWindow):
             return
 
         # 添加到预设列表
-        PRESET_MODELS[model_name] = {
+        _get_preset_models_dict()[model_name] = {
             "model": model_id,
             "base_url": base_url,
             "provider": "Custom",
@@ -1986,7 +1298,7 @@ class MainWindow(QMainWindow):
     def _remove_custom_model(self):
         """删除选中的自定义模型"""
         model_name = self.model_combo.currentText()
-        config = PRESET_MODELS.get(model_name, {})
+        config = _get_preset_models_dict().get(model_name, {})
 
         if config.get("provider") != "Custom":
             QMessageBox.warning(self, "提示", "只能删除自定义模型")
@@ -1999,7 +1311,7 @@ class MainWindow(QMainWindow):
         )
 
         if reply == QMessageBox.StandardButton.Yes:
-            del PRESET_MODELS[model_name]
+            del _get_preset_models_dict()[model_name]
             self._refresh_model_list()
 
     def _refresh_model_list(self):
@@ -2012,36 +1324,15 @@ class MainWindow(QMainWindow):
         filter_provider = "Custom" if current_provider == "自定义" else current_provider
 
         if current_provider == "全部":
-            self.model_combo.addItems(list(PRESET_MODELS.keys()))
+            self.model_combo.addItems(list(_get_preset_models_dict().keys()))
         else:
-            for name, config in PRESET_MODELS.items():
+            for name, config in _get_preset_models_dict().items():
                 if config.get("provider") == filter_provider:
                     self.model_combo.addItem(name)
 
         self.model_combo.blockSignals(False)
         if self.model_combo.count() > 0:
             self._on_model_changed(self.model_combo.currentText())
-
-    def _save_provider_keys(self):
-        """保存供应商 API Key 到配置文件"""
-        import json
-        key_file = PROJECT_ROOT / "provider_keys.json"
-        try:
-            with open(key_file, 'w', encoding='utf-8') as f:
-                json.dump(PROVIDER_API_KEYS, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
-
-    def _load_provider_keys(self):
-        """从配置文件加载供应商 API Key"""
-        import json
-        key_file = PROJECT_ROOT / "provider_keys.json"
-        if key_file.exists():
-            try:
-                with open(key_file, 'r', encoding='utf-8') as f:
-                    PROVIDER_API_KEYS.update(json.load(f))
-            except Exception:
-                pass
 
     def _on_drag_enter(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -2094,13 +1385,13 @@ class MainWindow(QMainWindow):
             try:
                 img_translator = ImageTranslator()
                 if img_translator.detect_scanned_pdf(file_path):
-                    self.ocr_status_label.setText("⚠️ 扫描件")
+                    self.ocr_status_label.setText("[警告] 扫描件")
                     self.ocr_status_label.setStyleSheet("""
                         color: #D32F2F; font-weight: bold; font-size: 11px;
                         padding: 2px 6px; background-color: #FFEBEE; border-radius: 3px;
                     """)
                 else:
-                    self.ocr_status_label.setText("✅ 文字版")
+                    self.ocr_status_label.setText("[成功] 文字版")
                     self.ocr_status_label.setStyleSheet("""
                         color: #4CAF50; font-weight: bold; font-size: 11px;
                         padding: 2px 6px; background-color: #E8F5E9; border-radius: 3px;
@@ -2178,20 +1469,16 @@ class MainWindow(QMainWindow):
         # 加载术语库（带领域过滤和自动识别）
         glossary_terms = []
         detected_domain = ""
-        if hasattr(self, 'term_replace_check') and self.term_replace_check.isChecked():
+        term_domain = self.term_domain_combo.currentData() if hasattr(self, 'term_domain_combo') else "off"
+
+        if term_domain != "off":
             try:
                 from gui.core import GlossaryManager
                 from gui.core.ai_glossary import get_sub_domains
                 from gui.core.domain_detector import get_best_domain
                 gm = GlossaryManager()
-                selected_domain = self.domain_combo.currentData() if hasattr(self, 'domain_combo') else ""
 
-                if selected_domain:
-                    detected_domain = selected_domain
-                    sub_domains = get_sub_domains(selected_domain)
-                    for sd in sub_domains:
-                        glossary_terms.extend(gm.get_all_terms(lang_in, lang_out, domain=sd))
-                else:
+                if term_domain == "auto":
                     # 自动识别：扫描前几页确定领域
                     try:
                         import pymupdf
@@ -2212,24 +1499,42 @@ class MainWindow(QMainWindow):
                             glossary_terms.extend(gm.get_all_terms(lang_in, lang_out, domain=sd))
                     else:
                         glossary_terms = gm.get_all_terms(lang_in, lang_out)
+                else:
+                    # 选定了具体领域（顶级或子领域）
+                    detected_domain = term_domain
+                    if "/" in term_domain:
+                        # 子领域（如 "AI/NLP"）
+                        glossary_terms.extend(gm.get_all_terms(lang_in, lang_out, domain=term_domain))
+                    else:
+                        # 顶级领域（如 "AI"），加载其全部子领域
+                        sub_domains = get_sub_domains(term_domain)
+                        for sd in sub_domains:
+                            glossary_terms.extend(gm.get_all_terms(lang_in, lang_out, domain=sd))
             except Exception:
                 pass
 
-        # 输出目录：在输入文件同目录下创建 "{目标语言}_{时间}" 文件夹
+        # 输出目录：在输入文件同目录下创建 "{目标语言}_{文件名前50字符}" 文件夹
 
         lang_display = self.lang_out_combo.currentText()
-        timestamp = datetime.now().strftime("%Y.%m.%d %H.%M")
-        output_folder_name = f"{lang_display}_{timestamp}"
         input_path = Path(self.input_file)
+        file_prefix = input_path.stem[:MAX_FILE_PREFIX_LENGTH]
+        output_folder_name = f"{lang_display}_{file_prefix}"
         actual_output_dir = input_path.parent / output_folder_name
         actual_output_dir.mkdir(exist_ok=True)
         actual_output_dir = str(actual_output_dir)
         self.output_dir_label.setText(f"输出: {actual_output_dir}")
 
+        context = ""
+        for preset_name, preset_cfg in _get_preset_models_dict().items():
+            if preset_cfg.get("model") == self.model_name_edit.text().strip():
+                context = preset_cfg.get("context", "")
+                break
+
         config = {
             "api_key": api_key,
             "base_url": self.base_url_edit.text().strip(),
             "model": self.model_name_edit.text().strip(),
+            "context": context,
             "lang_in": lang_in,
             "lang_out": lang_out,
             "input_file": self.input_file,
@@ -2237,8 +1542,12 @@ class MainWindow(QMainWindow):
             "pages": self.pages_edit.text().strip() or None,
             "no_dual": not self.dual_checkbox.isChecked(),
             "no_mono": not self.mono_checkbox.isChecked(),
-            "qps": self.qps_spin.value(),
-            "enable_term_replacement": hasattr(self, 'term_replace_check') and self.term_replace_check.isChecked(),
+            "qps": self.qps_spin.value() if not self.smart_mode_check.isChecked() else 20,
+            "smart_mode": self.smart_mode_check.isChecked(),
+            "enable_term_replacement": (
+                hasattr(self, 'term_domain_combo')
+                and self.term_domain_combo.currentData() != "off"
+            ),
             "glossary_terms": glossary_terms,
             "detected_domain": detected_domain,
             # 高级功能
@@ -2247,6 +1556,7 @@ class MainWindow(QMainWindow):
             "multi_engine_model2": self.multi_model2_combo.currentText() if hasattr(self, 'multi_model2_combo') else "glm-4-air",
             "enable_adaptive_mt": hasattr(self, 'amt_check') and self.amt_check.isChecked(),
             "enable_ocr": hasattr(self, 'ocr_check') and self.ocr_check.isChecked(),
+            "skip_references": hasattr(self, 'skip_references_check') and self.skip_references_check.isChecked(),
         }
 
         # 更新 UI
@@ -2260,7 +1570,7 @@ class MainWindow(QMainWindow):
         # 确保旧 worker 已停止，避免信号干扰
         if hasattr(self, 'worker') and self.worker and self.worker.isRunning():
             self.worker.cancel()
-            self.worker.wait(5000)
+            self.worker.wait(WORKER_WAIT_TIMEOUT_MS)
 
         # 启动工作线程
         self.worker = TranslationWorker(config)
@@ -2272,22 +1582,24 @@ class MainWindow(QMainWindow):
         self.worker.term_replaced.connect(self._on_term_replaced)
         self.worker.heartbeat.connect(self._on_heartbeat)
         self.worker.retry_happened.connect(self._on_retry_happened)
+        self.worker.network_paused.connect(self._on_network_paused)
+        self.worker.network_resumed.connect(self._on_network_resumed)
         self.worker.finished_success.connect(self._on_translation_success)
         self.worker.finished_error.connect(self._on_translation_error)
         
         # 启动心跳看门狗
-        self._watchdog = HeartbeatWatchdog(timeout=300.0)
+        self._watchdog = HeartbeatWatchdog(timeout=WATCHDOG_TIMEOUT_S)
         self._watchdog.start(callback=self._on_watchdog_timeout)
 
         # 启动看门狗定时器（每 2 秒检查心跳）
         self._watchdog_timer = QTimer(self)
         self._watchdog_timer.timeout.connect(self._check_watchdog)
-        self._watchdog_timer.start(2000)
+        self._watchdog_timer.start(WATCHDOG_CHECK_INTERVAL_MS)
         
         # 启动定时器：每秒更新时间显示
 
         self._elapsed_timer = QTimer(self)
-        self._elapsed_timer.setInterval(1000)  # 1 秒
+        self._elapsed_timer.setInterval(ELAPSED_TIMER_INTERVAL_MS)  # 1 秒
         self._elapsed_timer.timeout.connect(self._update_elapsed_time)
         self._elapsed_timer.start()
         
@@ -2297,13 +1609,13 @@ class MainWindow(QMainWindow):
         self._last_remaining = -1
 
         # 立即显示初始状态，避免"等待开始"卡住
-        self._on_log("🚀 翻译任务已启动")
+        self._on_log("[信息] 翻译任务已启动")
         if self._pdf_page_count > 0:
-            self._on_log(f"📄 文档页数: {self._pdf_page_count} 页")
+            self._on_log(f"[信息] 文档页数: {self._pdf_page_count} 页")
         if detected_domain:
-            self._on_log(f"🏷 文档领域: {detected_domain}")
+            self._on_log(f"[标签] 文档领域: {detected_domain}")
         if glossary_terms:
-            self._on_log(f"📖 已加载 {len(glossary_terms)} 条领域术语")
+            self._on_log(f"[术语] 已加载 {len(glossary_terms)} 条领域术语")
         self.progress_bar.setValue(1)
         
         self.worker.start()
@@ -2357,7 +1669,7 @@ class MainWindow(QMainWindow):
     def _on_term_replaced(self, count: int):
         """术语替换数量更新"""
         if count > 0:
-            self._on_log(f"📖 已应用 {count} 条术语替换")
+            self._on_log(f"[术语] 已应用 {count} 条术语替换")
 
     def _on_heartbeat(self):
         """心跳信号处理 - 重置看门狗"""
@@ -2371,11 +1683,27 @@ class MainWindow(QMainWindow):
 
     def _on_retry_happened(self, attempt: int, delay: float, error: str):
         """重试信号处理 - 更新日志"""
-        self._on_log(f"⚠️ 检测到限流/超时，第 {attempt} 次自动重试（等待 {delay:.1f}s）: {error[:80]}")
+        self._on_log(f"[警告] 检测到限流/超时，第 {attempt} 次自动重试（等待 {delay:.1f}s）: {error[:80]}")
+
+    def _on_network_paused(self, reason: str):
+        """网络暂停信号处理 - 弹窗警告"""
+        self._on_log(f"[错误] 网络异常：{reason}。翻译已暂停，等待网络恢复...")
+        # 显示非模态提示（不阻塞翻译线程）
+        QMessageBox.warning(
+            self,
+            "网络异常 - 翻译已暂停",
+            f"检测到网络连接异常，翻译已自动暂停。\n\n"
+            f"原因：{reason}\n\n"
+            f"翻译将在网络恢复后自动继续，请检查网络连接。",
+        )
+
+    def _on_network_resumed(self):
+        """网络恢复信号处理"""
+        self._on_log("[成功] 网络恢复，继续翻译（将自动重试失败的段落）")
 
     def _on_watchdog_timeout(self):
         """看门狗超时 - 安全停止"""
-        self._on_log("❌ 翻译任务超时（300秒无响应），执行安全停止...")
+        self._on_log("[错误] 翻译任务超时（300秒无响应），执行安全停止...")
         self._cancel_translation()
         QMessageBox.warning(self, "超时", "翻译任务长时间无响应，已自动停止。\n请检查网络连接或降低 QPS 设置后重试。")
 
@@ -2437,10 +1765,10 @@ class MainWindow(QMainWindow):
         completion_tokens = stats.get("completion_tokens", 0)
         model = stats.get("model", "unknown")
 
-        self._on_log(f"✅ 翻译完成!")
-        self._on_log(f"⏱ 总耗时: {int(total_time)}秒")
-        self._on_log(f"📊 Token: {total_tokens}")
-        self._on_log(f"📄 输出: {output_path}")
+        self._on_log(f"[成功] 翻译完成!")
+        self._on_log(f"[统计] 总耗时: {int(total_time)}秒")
+        self._on_log(f"[统计] Token: {total_tokens}")
+        self._on_log(f"[统计] 输出: {output_path}")
 
         # 记录成本
         try:
@@ -2452,15 +1780,29 @@ class MainWindow(QMainWindow):
                 cached_tokens=stats.get("cached_tokens", 0),
                 file_name=Path(self.input_file).name if self.input_file else "",
             )
-            self._on_log(f"💰 费用: ¥{record.total_cost:.4f}")
+            self._on_log(f"[费用] ¥{record.total_cost:.4f}")
         except Exception:
             pass
+
+        # 缓存命中率
+        translator = getattr(self.worker, 'translator', None)
+        cache_hits = getattr(translator, "translate_cache_call_count", 0) if translator else 0
+        total_calls = getattr(translator, "translate_call_count", 0) if translator else 0
+        if total_calls > 0:
+            hit_rate = cache_hits / total_calls * 100
+            self._on_log(f"[缓存] 缓存命中: {cache_hits}/{total_calls} ({hit_rate:.1f}%)")
 
         # 更新自适应统计 + 文件解锁
         self._update_adaptive_stats()
         FileUnlockManager.release_all_handles()
 
         self.output_path = output_path
+
+        # 系统通知（窗口非活跃时提醒用户）
+        send_notification(
+            "BabelDOC 翻译完成",
+            f"文件: {Path(output_path).name}\n耗时: {int(total_time)}秒 | Token: {total_tokens}",
+        )
 
         QMessageBox.information(self, "完成", f"翻译已完成!\n\n输出文件: {output_path}")
 
@@ -2469,7 +1811,7 @@ class MainWindow(QMainWindow):
         self.cancel_btn.setEnabled(False)
         self.stage_label.setText("错误")
         self.progress_label.setText("翻译失败")
-        self._on_log(f"❌ 错误: {error_msg}")
+        self._on_log(f"[错误] {error_msg}")
         
         # 停止心跳看门狗和定时器，清零倒计时
         if self._watchdog:
@@ -2485,35 +1827,59 @@ class MainWindow(QMainWindow):
         # 文件解锁（即使失败也要释放文件句柄）
         FileUnlockManager.release_all_handles()
 
+        # 系统通知（窗口非活跃时提醒用户）
+        send_notification("BabelDOC 翻译失败", f"错误: {error_msg[:100]}")
+
         QMessageBox.critical(self, "翻译失败", error_msg)
 
     def _open_output_dir(self):
         """打开输出目录（安全模式）"""
+        if not self.auto_open_output_check.isChecked():
+            QMessageBox.information(
+                self, "提示", "自动打开输出目录功能已禁用。\n请在设置中启用后再试。"
+            )
+            return
         try:
             # 1. 优先使用用户选择的输出目录
             if self.output_dir:
                 output_dir = Path(self.output_dir)
                 if output_dir.exists():
-                    subprocess.Popen(['explorer', str(output_dir)], shell=False)
+                    subprocess.Popen(
+                        ["explorer", str(output_dir)],
+                        shell=False,
+                        creationflags=0,
+                    )
                     return
 
             # 2. 回退到已翻译的输出文件所在目录
-            output_path = getattr(self, 'output_path', None)
+            output_path = getattr(self, "output_path", None)
             if output_path:
                 output_path = Path(output_path)
                 if output_path.exists():
-                    subprocess.Popen(['explorer', '/select,', str(output_path)], shell=False)
+                    subprocess.Popen(
+                        ["explorer", "/select,", str(output_path)],
+                        shell=False,
+                        creationflags=0,
+                    )
                     return
                 # 输出文件不存在，尝试其父目录
                 if output_path.parent.exists():
-                    subprocess.Popen(['explorer', str(output_path.parent)], shell=False)
+                    subprocess.Popen(
+                        ["explorer", str(output_path.parent)],
+                        shell=False,
+                        creationflags=0,
+                    )
                     return
 
             # 3. 回退到输入文件所在目录
             if self.input_file:
                 input_dir = Path(self.input_file).parent
                 if input_dir.exists():
-                    subprocess.Popen(['explorer', str(input_dir)], shell=False)
+                    subprocess.Popen(
+                        ["explorer", str(input_dir)],
+                        shell=False,
+                        creationflags=0,
+                    )
                     return
 
             # 4. 都没有则提示
@@ -2589,7 +1955,7 @@ class MainWindow(QMainWindow):
             doc.close()
 
             if total_chars == 0:
-                total_chars = 5000  # 默认值
+                total_chars = DEFAULT_CHAR_COUNT  # 默认值
 
             model = self.model_name_edit.text().strip()
             lang_in = LANGUAGES.get(self.lang_in_combo.currentText(), "en")
@@ -2634,9 +2000,9 @@ class MainWindow(QMainWindow):
         """显示模型成本对比"""
         try:
             analyzer = CostAnalyzer()
-            comparisons = analyzer.get_model_comparison(10000)
+            comparisons = analyzer.get_model_comparison(COMPARISON_CHAR_COUNT)
 
-            text = "📊 10000 字符翻译成本对比:\n\n"
+            text = f"[统计] {COMPARISON_CHAR_COUNT} 字符翻译成本对比:\n\n"
             text += f"{'模型':<30} {'Token':<12} {'费用':<10} {'性价比'}\n"
             text += "-" * 65 + "\n"
 
@@ -2749,7 +2115,7 @@ class MainWindow(QMainWindow):
             is_scanned = translator.detect_scanned_pdf(self.input_file)
 
             if is_scanned:
-                self.ocr_status_label.setText("⚠️ 检测到扫描件")
+                self.ocr_status_label.setText("[警告] 检测到扫描件")
                 self.ocr_status_label.setStyleSheet("""
                     color: #D32F2F;
                     font-weight: bold;
@@ -2767,7 +2133,7 @@ class MainWindow(QMainWindow):
                     "3. 翻译质量可能受影响"
                 )
             else:
-                self.ocr_status_label.setText("✅ 文字版 PDF")
+                self.ocr_status_label.setText("[成功] 文字版 PDF")
                 self.ocr_status_label.setStyleSheet("""
                     color: #4CAF50;
                     font-weight: bold;
@@ -2788,13 +2154,16 @@ class MainWindow(QMainWindow):
     # 配置持久化
     # ============================================================
 
-    def _save_settings(self):
-        """保存当前配置"""
+    def _save_settings(self, silent: bool = False):
+        """保存当前配置
+
+        Args:
+            silent: 为静默保存（不显示弹窗），用于关闭窗口时自动保存
+        """
         import json
         settings = {
             "provider": self.provider_combo.currentText(),
             "model": self.model_combo.currentText(),
-            "api_key": self.api_key_edit.text(),
             "base_url": self.base_url_edit.text(),
             "model_name": self.model_name_edit.text(),
             "lang_in": self.lang_in_combo.currentText(),
@@ -2804,21 +2173,40 @@ class MainWindow(QMainWindow):
             "mono": self.mono_checkbox.isChecked(),
             "qps": self.qps_spin.value(),
             "output_dir": self.output_dir,
+            "auto_open_output_dir": self.auto_open_output_check.isChecked(),
         }
         try:
             with open(self.settings_file, 'w', encoding='utf-8') as f:
                 json.dump(settings, f, indent=2, ensure_ascii=False)
-            QMessageBox.information(self, "保存成功", f"配置已保存到:\n{self.settings_file}")
+            # 使用 config_manager 保存 API key 和设置
+            api_key = self.api_key_edit.text()
+            self.config_manager.update_last_session(
+                api_key=api_key,
+                auto_open_output_dir=self.auto_open_output_check.isChecked(),
+            )
+            self.config_manager.save()
+            if not silent:
+                QMessageBox.information(self, "保存成功", f"配置已保存到:\n{self.settings_file}")
         except Exception as e:
-            QMessageBox.warning(self, "保存失败", str(e))
+            if not silent:
+                QMessageBox.warning(self, "保存失败", str(e))
+            else:
+                logging.getLogger(__name__).warning("保存设置失败: %s", e)
 
     def _load_settings(self):
         """加载已保存的配置"""
         import json
+
+        # 无论 settings_file 是否存在，都先从 config_manager 加载 API Key
+        api_key_from_config = self.config_manager.config.last_session.api_key
+
         if not self.settings_file.exists():
-            # 默认选中 DeepSeek-Chat
-            self.provider_combo.setCurrentText("DeepSeek")
-            self._on_model_changed("DeepSeek-Chat")
+            # 默认选中 LongCat-2.0
+            self.provider_combo.setCurrentText("LongCat")
+            self._on_model_changed("LongCat-2.0")
+            # 加载保存的 API Key
+            if api_key_from_config:
+                self.api_key_edit.setText(api_key_from_config)
             return
 
         try:
@@ -2829,8 +2217,13 @@ class MainWindow(QMainWindow):
             saved_provider = settings.get("provider", "全部")
             self.provider_combo.setCurrentText(saved_provider)
 
-            self.model_combo.setCurrentText(settings.get("model", "DeepSeek-Chat"))
-            self.api_key_edit.setText(settings.get("api_key", ""))
+            self.model_combo.setCurrentText(settings.get("model", "LongCat-2.0"))
+            # 优先从 config_manager 加载 API Key（更安全）
+            if api_key_from_config:
+                self.api_key_edit.setText(api_key_from_config)
+            else:
+                # 回退到 settings_file 中的 API Key
+                self.api_key_edit.setText(settings.get("api_key", ""))
             self.base_url_edit.setText(settings.get("base_url", ""))
             self.model_name_edit.setText(settings.get("model_name", ""))
             self.lang_in_combo.setCurrentText(settings.get("lang_in", "English"))
@@ -2838,20 +2231,30 @@ class MainWindow(QMainWindow):
             self.pages_edit.setText(settings.get("pages", ""))
             self.dual_checkbox.setChecked(settings.get("dual", True))
             self.mono_checkbox.setChecked(settings.get("mono", True))
-            self.qps_spin.setValue(settings.get("qps", 2))
+            self.qps_spin.setValue(settings.get("qps", 10))
+            self.auto_open_output_check.setChecked(
+                settings.get("auto_open_output_dir", True)
+            )
 
             if settings.get("output_dir"):
                 self.output_dir = settings["output_dir"]
                 self.output_dir_label.setText(f"输出: {self.output_dir}")
 
-            self._on_model_changed(settings.get("model", "DeepSeek-Chat"))
+            self._on_model_changed(settings.get("model", "LongCat-2.0"))
         except Exception:
-            self.provider_combo.setCurrentText("DeepSeek")
-            self._on_model_changed("DeepSeek-Chat")
+            self.provider_combo.setCurrentText("LongCat")
+            self._on_model_changed("LongCat-2.0")
+            if api_key_from_config:
+                self.api_key_edit.setText(api_key_from_config)
 
     def closeEvent(self, event):
-        """关闭窗口时停止工作线程"""
+        """关闭窗口时停止工作线程并自动保存设置"""
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
-            self.worker.wait(3000)
+            self.worker.wait(CLOSE_WAIT_TIMEOUT_MS)
+        # 自动保存设置（静默保存，不阻塞关闭）
+        try:
+            self._save_settings(silent=True)
+        except Exception as e:
+            logging.getLogger(__name__).warning("关闭时保存设置失败: %s", e)
         event.accept()
